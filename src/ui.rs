@@ -46,7 +46,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Screen::Done => "4/4  Results",
     };
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" JobFinder ", Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" Hired ", Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("    "),

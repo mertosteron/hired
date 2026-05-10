@@ -1,8 +1,12 @@
 [package]
-name = "jobfinder"
+name = "hired"
 version = "0.1.0"
 edition = "2021"
 description = "Terminal bot that scrapes company sites for HR emails and sends a CV via SMTP"
+
+[[bin]]
+name = "hired"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"

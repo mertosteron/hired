@@ -1,4 +1,4 @@
-# JobFinder
+# Hired
 
 A terminal-based Rust bot that:
 
@@ -13,7 +13,7 @@ A terminal-based Rust bot that:
 ## Project layout
 
 ```
-JobFinder/
+Hired/
 ├── Cargo.toml
 ├── config.example.toml
 ├── README.md
@@ -27,16 +27,52 @@ JobFinder/
     └── error.rs      # unified error type
 ```
 
-## Build
+## Install
 
-Requires a recent stable Rust toolchain (1.75+).
+Requires a recent stable Rust toolchain (1.75+). Install via
+[rustup](https://rustup.rs) — this also adds `~/.cargo/bin` (or
+`%USERPROFILE%\.cargo\bin` on Windows) to your `PATH`.
+
+From the project root:
 
 ```bash
-cd JobFinder
-cargo build --release
+cargo install --path .
 ```
 
-The binary lands at `./target/release/jobfinder`.
+This builds in release mode and drops a `hired` executable into Cargo's
+bin directory. After that, you can launch the app from any terminal —
+on Linux, macOS, or Windows — by typing:
+
+```bash
+hired
+```
+
+To update after pulling new changes, run `cargo install --path . --force`.
+
+To uninstall: `cargo uninstall hired`.
+
+### PATH troubleshooting
+
+If `hired` is not found after installation, make sure Cargo's bin
+directory is on your `PATH`:
+
+- **Linux / macOS** — add to `~/.bashrc`, `~/.zshrc`, or equivalent:
+  ```bash
+  export PATH="$HOME/.cargo/bin:$PATH"
+  ```
+- **Windows (PowerShell)** — verify `%USERPROFILE%\.cargo\bin` is in
+  your user `PATH` (rustup adds it automatically; restart the terminal
+  if you just installed Rust).
+
+### Build without installing
+
+If you only want a local binary:
+
+```bash
+cargo build --release
+./target/release/hired        # Linux / macOS
+.\target\release\hired.exe    # Windows
+```
 
 ## Configure
 
@@ -45,17 +81,21 @@ cp config.example.toml config.toml
 $EDITOR config.toml         # set SMTP creds, sender name, default subject/body, cv_path
 ```
 
+`config.toml` is loaded from the **current working directory** at
+startup, so `cd` into the folder where you keep your config and CV
+before running `hired`.
+
 For Gmail, generate an [App Password](https://support.google.com/accounts/answer/185833)
 and use it as `password`. Port `587` uses STARTTLS, port `465` uses implicit TLS —
 both are supported automatically based on the port number.
 
-Drop your CV next to the binary as `cv.pdf` (or point `cv_path` at any
-PDF file).
+Drop your CV in the same directory as `cv.pdf` (or point `cv_path` at
+any PDF file).
 
 ## Run
 
 ```bash
-./target/release/jobfinder
+hired
 ```
 
 ### Workflow inside the TUI

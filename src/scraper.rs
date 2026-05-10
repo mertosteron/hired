@@ -149,7 +149,7 @@ pub async fn scrape_emails_for_url(input: &str) -> Result<Vec<String>, BotError>
     let client = reqwest::Client::builder()
         .user_agent(concat!(
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ",
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 JobFinderBot/0.1"
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 HiredBot/0.1"
         ))
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::limited(5))
