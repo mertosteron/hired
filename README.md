@@ -1,120 +1,125 @@
 # Hired
 
-A terminal-based Rust bot that:
-
-1. Takes a list of company website URLs.
-2. Scrapes each site (homepage + likely "contact"/"careers" pages) for
-   `mailto:` links and email addresses.
-3. Lets you confirm which address to use per site in a TUI (built with
-   `ratatui` + `crossterm`).
-4. Sends a pre-written email with your CV attached as a PDF over SMTP
-   (via `lettre`).
-
-## Project layout
+Terminal tabanlı bir iş/staj başvuru botu. Şirket websitelerini tarayarak HR email adreslerini bulur, CV ve transkriptini otomatik olarak gönderir.
 
 ```
-Hired/
-├── Cargo.toml
-├── config.example.toml
-├── README.md
-└── src/
-    ├── main.rs       # entry point, terminal setup, tokio runtime
-    ├── app.rs        # app state machine + event loop
-    ├── ui.rs         # ratatui rendering for every screen
-    ├── scraper.rs    # reqwest + scraper + regex email extraction
-    ├── mailer.rs     # lettre multipart SMTP send with PDF attachment
-    ├── config.rs     # TOML config (SMTP creds, defaults)
-    └── error.rs      # unified error type
+URL listesi gir → Siteleri tara → Email seç → Mesaj yaz → Gönder
 ```
 
-## Install
+---
 
-Requires a recent stable Rust toolchain (1.75+). Install via
-[rustup](https://rustup.rs) — this also adds `~/.cargo/bin` (or
-`%USERPROFILE%\.cargo\bin` on Windows) to your `PATH`.
+## Ne yapar?
 
-From the project root:
+1. Verdiğin şirket URL'lerini tarar (ana sayfa + iletişim/kariyer sayfaları).
+2. Bulunan email adreslerini sıralar ve hangisini kullanacağını seçmeni ister.
+3. Yazdığın mesajı, CV'ni ve (isteğe bağlı) transkriptini mail ile gönderir.
+4. Spama düşmemek için mailler arasında rastgele 1-4 dakika bekler.
+5. Gönderim sonuçlarını `send_log_YYYYMMDD.csv` dosyasına kaydeder.
+
+---
+
+## Kurulum
+
+Rust 1.75+ gerekli. [rustup.rs](https://rustup.rs) ile yükleyebilirsin.
 
 ```bash
 cargo install --path .
 ```
 
-This builds in release mode and drops a `hired` executable into Cargo's
-bin directory. After that, you can launch the app from any terminal —
-on Linux, macOS, or Windows — by typing:
+Sonrasında herhangi bir terminalden `hired` yazarak başlatabilirsin.
 
-```bash
-hired
-```
+Güncelleme için: `cargo install --path . --force`
+Kaldırmak için: `cargo uninstall hired`
 
-To update after pulling new changes, run `cargo install --path . --force`.
+> `hired` komutu bulunamazsa `~/.cargo/bin` klasörünün PATH'te olduğunu kontrol et:
+> ```bash
+> export PATH="$HOME/.cargo/bin:$PATH"
+> ```
 
-To uninstall: `cargo uninstall hired`.
+---
 
-### PATH troubleshooting
-
-If `hired` is not found after installation, make sure Cargo's bin
-directory is on your `PATH`:
-
-- **Linux / macOS** — add to `~/.bashrc`, `~/.zshrc`, or equivalent:
-  ```bash
-  export PATH="$HOME/.cargo/bin:$PATH"
-  ```
-- **Windows (PowerShell)** — verify `%USERPROFILE%\.cargo\bin` is in
-  your user `PATH` (rustup adds it automatically; restart the terminal
-  if you just installed Rust).
-
-### Build without installing
-
-If you only want a local binary:
-
-```bash
-cargo build --release
-./target/release/hired        # Linux / macOS
-.\target\release\hired.exe    # Windows
-```
-
-## Configure
+## Yapılandırma
 
 ```bash
 cp config.example.toml config.toml
-$EDITOR config.toml         # set SMTP creds, sender name, default subject/body, cv_path
 ```
 
-`config.toml` is loaded from the **current working directory** at
-startup, so `cd` into the folder where you keep your config and CV
-before running `hired`.
+`config.toml` dosyasını aç ve şu alanları doldur:
 
-For Gmail, generate an [App Password](https://support.google.com/accounts/answer/185833)
-and use it as `password`. Port `587` uses STARTTLS, port `465` uses implicit TLS —
-both are supported automatically based on the port number.
+```toml
+default_subject = "Staj Başvurusu — Adın Soyadın"
+default_body    = """Merhaba, ..."""
+cv_path         = "cv.pdf"
+transcript_path = "transkript.pdf"   # boş bırakırsan eklenmez
 
-Drop your CV in the same directory as `cv.pdf` (or point `cv_path` at
-any PDF file).
+send_delay_min_secs = 60    # mailler arası minimum bekleme (saniye)
+send_delay_max_secs = 240   # mailler arası maksimum bekleme (saniye)
+daily_limit         = 50    # oturum başına maksimum mail sayısı
+send_window_start   = 8     # kaçta gönderilmeye başlansın (saat, 0-23)
+send_window_end     = 22    # kaçta durulsun (saat, 0-23)
 
-## Run
+[smtp]
+server       = "smtp.gmail.com"
+port         = 587           # 587 = STARTTLS, 465 = TLS
+username     = "sen@gmail.com"
+password     = "uygulama-sifresi"   # Google App Password
+from_address = "sen@gmail.com"
+from_name    = "Adın Soyadın"
+```
+
+> **Gmail kullanıyorsan:** normal şifren çalışmaz. Google hesabında
+> [App Password](https://support.google.com/accounts/answer/185833) oluştur ve onu kullan.
+
+`config.toml` ve CV dosyaları **çalışma dizininde** olmalı. Uygulamayı bu klasörden başlat.
+
+---
+
+## Kullanım
 
 ```bash
 hired
 ```
 
-### Workflow inside the TUI
+### Ekranlar
 
-| Screen        | Keys |
-| ------------- | ---- |
-| **URLs**      | Type/paste one URL per line. `F2` or `Ctrl+S` starts scraping. `Ctrl+L` loads `urls.txt` from CWD. `Ctrl+Q` quits. |
-| **Scraping**  | Auto-progresses. Wait for it to finish. |
-| **Review**    | `↑/↓` pick site, `←/→` cycle email candidates, `Space` skip/include, `F2` continue. `Esc` returns to URLs. |
-| **Compose**   | `Tab` cycles between Subject / Body / CV path. Type to edit. `F2` starts sending. `Esc` returns to review. |
-| **Sending**   | Auto-progresses. |
-| **Done**      | Per-site results. `q` or `Esc` to exit. |
+| Ekran | Tuşlar |
+|---|---|
+| **URLs** | URL'leri alt alta yaz/yapıştır. `F2` taramayı başlatır. `Ctrl+L` → `urls.txt`'yi yükler. `Ctrl+Q` çıkış. |
+| **Scraping** | Otomatik ilerler, beklenir. |
+| **Review** | `↑/↓` site seç, `←/→` email adayı değiştir, `Space` dahil et/çıkar, `F2` devam et. `Esc` geri. |
+| **Compose** | `Tab/BackTab` alanlar arası geçiş (konu / mesaj / CV / transkript). `F2` gönderimi başlatır. `Esc` geri. |
+| **Sending** | Otomatik ilerler. Mailler arası rastgele bekleme uygulanır. |
+| **Done** | Sonuçlar gösterilir, `send_log_YYYYMMDD.csv` oluşturulur. `q` veya `Esc` ile çık. |
 
-## Notes
+---
 
-- The scraper crawls the homepage plus up to 5 anchor links whose href or
-  text contains words like `contact`, `careers`, `jobs`, `about`, `hr`.
-- Found addresses are filtered to drop obvious junk
-  (e.g. `*.png`, `*@example.com`, `*@sentry.io`, Wix telemetry).
-- SMTP failures, HTTP errors, and pages with no emails are reported per-row
-  rather than aborting the whole run.
-- Rate limit yourself responsibly. The bot pauses briefly between sends.
+## Nasıl çalışır?
+
+**Email tarama (5 aşamalı):**
+1. Ana sayfa HTML metni — regex ile email arama
+2. `mailto:` href linkleri
+3. İletişim/kariyer/hakkımızda alt sayfaları (8'e kadar)
+4. Tüm HTML element attribute'ları (`data-email` gibi gizli alanlar)
+5. `<script>` tag içerikleri (JS ile yüklenen siteler)
+
+Bulunan adresler öncelik sırasına göre sıralanır: `hr@`, `kariyer@`, `jobs@` gibi adresler öne gelir. `noreply@` ve spam adresler elenir.
+
+**Spam koruması:**
+- Mailler arası rastgele gecikme (varsayılan: 1–4 dakika)
+- Günlük gönderim limiti (varsayılan: 50)
+- Sadece belirtilen saat aralığında gönderim (varsayılan: 08:00–22:00)
+
+---
+
+## Proje yapısı
+
+```
+src/
+├── main.rs     — giriş noktası, terminal kurulumu
+├── app.rs      — uygulama state makinesi ve event döngüsü
+├── ui.rs       — ratatui ile her ekranın çizimi
+├── scraper.rs  — 5 aşamalı email tarayıcı
+├── mailer.rs   — SMTP gönderici (CV + transkript eki)
+├── config.rs   — TOML config
+└── error.rs    — hata tipleri
+```

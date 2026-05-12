@@ -3,7 +3,9 @@ use crate::mailer;
 use crate::scraper;
 use crate::ui;
 use anyhow::Result;
+use chrono::{Local, Timelike};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use rand::Rng;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 use std::time::{Duration, Instant};
@@ -49,6 +51,7 @@ pub enum ComposeField {
     Subject,
     Body,
     CvPath,
+    TranscriptPath,
 }
 
 impl ComposeField {
@@ -56,8 +59,14 @@ impl ComposeField {
         match self {
             ComposeField::Subject => ComposeField::Body,
             ComposeField::Body => ComposeField::CvPath,
-            ComposeField::CvPath => ComposeField::Subject,
+            ComposeField::CvPath => ComposeField::TranscriptPath,
+            ComposeField::TranscriptPath => ComposeField::Subject,
         }
+    }
+
+    fn prev(self) -> Self {
+        // prev = next 3 times in a 4-field cycle
+        self.next().next().next()
     }
 }
 
@@ -69,6 +78,7 @@ pub struct App {
     pub subject: TextArea<'static>,
     pub body: TextArea<'static>,
     pub cv_path: TextArea<'static>,
+    pub transcript_path: TextArea<'static>,
     pub compose_focus: ComposeField,
 
     pub sites: Vec<ScrapedSite>,
@@ -104,6 +114,9 @@ impl App {
         let mut cv_path = TextArea::from(vec![config.cv_path.clone()]);
         cv_path.set_cursor_line_style(Default::default());
 
+        let mut transcript_path = TextArea::from(vec![config.transcript_path.clone()]);
+        transcript_path.set_cursor_line_style(Default::default());
+
         Self {
             config,
             screen: Screen::Urls,
@@ -111,6 +124,7 @@ impl App {
             subject,
             body,
             cv_path,
+            transcript_path,
             compose_focus: ComposeField::Subject,
             sites: Vec::new(),
             review_idx: 0,
@@ -184,10 +198,12 @@ impl App {
                         .iter()
                         .filter(|r| r.status.is_ok())
                         .count();
+                    let log_path = self.write_csv_log();
                     self.status = format!(
-                        "Done. {}/{} sent successfully. q/Esc to quit.",
+                        "Done. {}/{} sent successfully. Log: {}  q/Esc to quit.",
                         ok,
-                        self.send_results.len()
+                        self.send_results.len(),
+                        log_path,
                     );
                     break;
                 }
@@ -200,8 +216,33 @@ impl App {
         }
     }
 
+    fn write_csv_log(&self) -> String {
+        use std::io::Write;
+        let date = Local::now().format("%Y%m%d").to_string();
+        let path = format!("send_log_{date}.csv");
+        let write = || -> std::io::Result<()> {
+            let exists = std::path::Path::new(&path).exists();
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            if !exists {
+                writeln!(f, "timestamp,url,email,status,error")?;
+            }
+            let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            for r in &self.send_results {
+                let (status, error) = match &r.status {
+                    Ok(()) => ("ok", String::new()),
+                    Err(e) => ("error", e.replace(',', ";")),
+                };
+                writeln!(f, "{now},{},{},{status},{error}", r.url, r.email)?;
+            }
+            Ok(())
+        };
+        if write().is_ok() { path } else { "(log write failed)".into() }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
-        // global quit
         if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return;
@@ -290,7 +331,7 @@ impl App {
                 }
                 self.screen = Screen::Compose;
                 self.status =
-                    "Tab cycles fields. Edit subject/body/CV path. F2 to send. Esc back.".into();
+                    "Tab/BackTab cycle fields. Edit subject/body/CV/transcript. F2 to send. Esc back.".into();
             }
             KeyCode::Esc => {
                 self.screen = Screen::Urls;
@@ -318,15 +359,14 @@ impl App {
                 return;
             }
             (KeyCode::BackTab, _) => {
-                self.compose_focus = self.compose_focus.next().next();
+                self.compose_focus = self.compose_focus.prev();
                 return;
             }
             _ => {}
         }
-        // Single-line fields: swallow Enter.
         let is_single_line = matches!(
             self.compose_focus,
-            ComposeField::Subject | ComposeField::CvPath
+            ComposeField::Subject | ComposeField::CvPath | ComposeField::TranscriptPath
         );
         if is_single_line && key.code == KeyCode::Enter {
             return;
@@ -335,6 +375,7 @@ impl App {
             ComposeField::Subject => &mut self.subject,
             ComposeField::Body => &mut self.body,
             ComposeField::CvPath => &mut self.cv_path,
+            ComposeField::TranscriptPath => &mut self.transcript_path,
         };
         target.input(key);
     }
@@ -401,6 +442,14 @@ impl App {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let transcript_path = self
+            .transcript_path
+            .lines()
+            .first()
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
 
         if subject.is_empty() {
             self.status = "Subject is empty.".into();
@@ -415,37 +464,74 @@ impl App {
             return;
         }
 
-        let jobs: Vec<(String, String)> = self
+        // Time window check
+        let hour = Local::now().hour();
+        if hour < self.config.send_window_start || hour >= self.config.send_window_end {
+            self.status = format!(
+                "Outside send window ({}:00–{}:00). Emails are sent only during these hours to maximize read rates.",
+                self.config.send_window_start, self.config.send_window_end
+            );
+            return;
+        }
+
+        let all_jobs: Vec<(String, String)> = self
             .sites
             .iter()
             .filter(|s| !s.skip && !s.emails.is_empty())
             .map(|s| (s.url.clone(), s.emails[s.selected].clone()))
             .collect();
 
-        if jobs.is_empty() {
+        if all_jobs.is_empty() {
             self.status = "No targets selected.".into();
             return;
         }
 
+        // Daily limit
+        let limit = self.config.daily_limit;
+        let capped = all_jobs.len() > limit;
+        let jobs: Vec<(String, String)> = all_jobs.into_iter().take(limit).collect();
+
         self.send_results.clear();
         self.send_progress = (0, jobs.len());
         self.screen = Screen::Sending;
-        self.status = format!("Sending {} email(s)…", jobs.len());
+        self.status = if capped {
+            format!(
+                "Sending {} email(s) (capped at daily limit {})… delay: {}-{}s per email.",
+                jobs.len(), limit,
+                self.config.send_delay_min_secs, self.config.send_delay_max_secs,
+            )
+        } else {
+            format!(
+                "Sending {} email(s)… delay: {}-{}s per email.",
+                jobs.len(),
+                self.config.send_delay_min_secs, self.config.send_delay_max_secs,
+            )
+        };
 
         let smtp = self.config.smtp.clone();
+        let delay_min = self.config.send_delay_min_secs;
+        let delay_max = self.config.send_delay_max_secs;
         let (tx, rx) = mpsc::unbounded_channel();
         self.bg_rx = Some(rx);
 
         tokio::spawn(async move {
-            for (url, email) in jobs {
-                let res = mailer::send_email(&smtp, &email, &subject, &body, &cv_path).await;
+            for (i, (url, email)) in jobs.iter().enumerate() {
+                let res = mailer::send_email(&smtp, email, &subject, &body, &cv_path, &transcript_path).await;
                 let send_result = SendResult {
-                    url,
-                    email,
+                    url: url.clone(),
+                    email: email.clone(),
                     status: res.map_err(|e| e.to_string()),
                 };
                 let _ = tx.send(BgEvent::SendOne(send_result));
-                tokio::time::sleep(Duration::from_millis(800)).await;
+                if i + 1 < jobs.len() {
+                    // Compute delay before await so ThreadRng (non-Send) is dropped.
+                    let secs = if delay_max > delay_min {
+                        rand::thread_rng().gen_range(delay_min..=delay_max)
+                    } else {
+                        delay_min
+                    };
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                }
             }
             let _ = tx.send(BgEvent::SendDone);
         });

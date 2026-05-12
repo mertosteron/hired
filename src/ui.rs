@@ -249,6 +249,7 @@ fn render_compose(f: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Min(5),
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -273,23 +274,39 @@ fn render_compose(f: &mut Frame, area: Rect, app: &mut App) {
     app.body
         .set_block(block("body", app.compose_focus == ComposeField::Body));
     app.cv_path.set_block(block(
-        "cv path (must point to a PDF)",
+        "cv path (PDF required)",
         app.compose_focus == ComposeField::CvPath,
+    ));
+    app.transcript_path.set_block(block(
+        "transcript path (optional PDF)",
+        app.compose_focus == ComposeField::TranscriptPath,
     ));
 
     f.render_widget(&app.subject, chunks[0]);
     f.render_widget(&app.body, chunks[1]);
     f.render_widget(&app.cv_path, chunks[2]);
+    f.render_widget(&app.transcript_path, chunks[3]);
 
     let count = app.sites.iter().filter(|s| !s.skip && !s.emails.is_empty()).count();
+    let capped = count.min(app.config.daily_limit);
     let preview = Paragraph::new(Line::from(vec![
-        Span::styled("Tab", bold()),
+        Span::styled("Tab/BackTab", bold()),
         Span::raw(" cycle  "),
         Span::styled("F2", bold()),
         Span::raw(" send  "),
         Span::styled("Esc", bold()),
         Span::raw(" back   "),
-        Span::styled(format!("{count} target(s)"), focused_style),
+        Span::styled(format!("{capped} target(s)"), focused_style),
+        Span::raw(if count > app.config.daily_limit {
+            format!(" (limit {}/{})", app.config.daily_limit, count)
+        } else {
+            String::new()
+        }),
+        Span::raw("  delay: "),
+        Span::styled(
+            format!("{}-{}s", app.config.send_delay_min_secs, app.config.send_delay_max_secs),
+            unfocused_style,
+        ),
         Span::raw("  from: "),
         Span::styled(
             format!("{} <{}>", app.config.smtp.from_name, app.config.smtp.from_address),
@@ -297,7 +314,7 @@ fn render_compose(f: &mut Frame, area: Rect, app: &mut App) {
         ),
     ]))
     .block(Block::default().borders(Borders::ALL).title(" actions "));
-    f.render_widget(preview, chunks[3]);
+    f.render_widget(preview, chunks[4]);
 }
 
 fn render_sending(f: &mut Frame, area: Rect, app: &App) {

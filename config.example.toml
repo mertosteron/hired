@@ -12,6 +12,24 @@ Best regards,
 """
 cv_path = "cv.pdf"
 
+# Optional second attachment (e.g. transcript). Leave empty or remove to skip.
+transcript_path = ""
+
+# Random delay between emails in seconds (spam protection).
+# Actual delay per email is chosen uniformly in [min, max].
+# Defaults: 60–240 seconds (1–4 minutes).
+send_delay_min_secs = 60
+send_delay_max_secs = 240
+
+# Maximum emails sent per session (daily guard). Default: 50.
+daily_limit = 50
+
+# Only send emails between these hours (local time, 0–23).
+# Emails sent in the morning have higher read rates.
+# Default: 8:00–22:00.
+send_window_start = 8
+send_window_end = 22
+
 [smtp]
 # Gmail example. Use an App Password, not your normal account password.
 # https://support.google.com/accounts/answer/185833
