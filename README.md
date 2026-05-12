@@ -109,7 +109,7 @@ Found addresses are ranked by relevance — `hr@`, `careers@`, `jobs@` float to 
 
 - Random delay between emails (default: 1–4 minutes)
 - Per-session send limit (default: 50)
-- Time-window enforcement — no emails sent outside configured hours (default: 08:00–22:00)
+- Time-window enforcement — no emails sent outside configured hours (Recommended hours : 08:00–10:00)
 
 ---
 
