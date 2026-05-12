@@ -24,11 +24,13 @@ send_delay_max_secs = 240
 # Maximum emails sent per session (daily guard). Default: 50.
 daily_limit = 50
 
-# Only send emails between these hours (local time, 0–23).
-# Emails sent in the morning have higher read rates.
-# Default: 8:00–22:00.
+# Only send emails between these hours, 0–23. Default: 8:00–22:00.
 send_window_start = 8
 send_window_end = 22
+
+# IANA timezone for the send window. "Local" uses system clock.
+# Examples: "Europe/Istanbul", "America/New_York", "UTC"
+timezone = "Local"
 
 [smtp]
 # Gmail example. Use an App Password, not your normal account password.

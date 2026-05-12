@@ -3,7 +3,8 @@ use crate::mailer;
 use crate::scraper;
 use crate::ui;
 use anyhow::Result;
-use chrono::{Local, Timelike};
+use chrono::Local;
+use chrono::Timelike;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rand::Rng;
 use ratatui::backend::Backend;
@@ -19,12 +20,12 @@ pub enum Screen {
     Review,
     Compose,
     Sending,
-    Done,
 }
 
 #[derive(Debug, Clone)]
 pub struct ScrapedSite {
     pub url: String,
+    pub company_name: String,
     pub emails: Vec<String>,
     pub selected: usize,
     pub skip: bool,
@@ -40,6 +41,7 @@ pub struct SendResult {
 
 #[derive(Debug)]
 pub enum BgEvent {
+    TotalUrls(usize),
     ScrapeOne(ScrapedSite),
     ScrapeDone,
     SendOne(SendResult),
@@ -65,7 +67,6 @@ impl ComposeField {
     }
 
     fn prev(self) -> Self {
-        // prev = next 3 times in a 4-field cycle
         self.next().next().next()
     }
 }
@@ -98,17 +99,15 @@ pub struct App {
 impl App {
     pub fn new(config: Config, startup_warning: Option<String>) -> Self {
         let mut urls_input = TextArea::default();
-        urls_input.set_placeholder_text("Paste one URL per line, e.g.\nhttps://example.com\nacme.io");
+        urls_input.set_placeholder_text(
+            "Paste one URL per line, e.g.\nhttps://example.com\nhttps://cryptoslate.com/companies/region/europe/",
+        );
 
         let mut subject = TextArea::from(vec![config.default_subject.clone()]);
         subject.set_cursor_line_style(Default::default());
 
         let body = TextArea::from(
-            config
-                .default_body
-                .lines()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
+            config.default_body.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
         );
 
         let mut cv_path = TextArea::from(vec![config.cv_path.clone()]);
@@ -130,7 +129,7 @@ impl App {
             review_idx: 0,
             send_results: Vec::new(),
             status: startup_warning.unwrap_or_else(|| {
-                "Ready. Paste URLs (one per line). Press F2 to scrape, Ctrl+Q to quit.".into()
+                "Ready — paste URLs (one per line) or a directory URL.  Ctrl+S scrape · Ctrl+Q quit".into()
             }),
             bg_rx: None,
             scrape_progress: (0, 0),
@@ -146,9 +145,7 @@ impl App {
         while !self.should_quit {
             terminal.draw(|f| ui::render(f, self))?;
 
-            let timeout = tick
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or(Duration::from_millis(0));
+            let timeout = tick.checked_sub(last_tick.elapsed()).unwrap_or(Duration::ZERO);
 
             if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
@@ -171,6 +168,10 @@ impl App {
         let Some(rx) = self.bg_rx.as_mut() else { return };
         loop {
             match rx.try_recv() {
+                Ok(BgEvent::TotalUrls(total)) => {
+                    self.scrape_progress.1 = total;
+                    self.status = format!("Scraping {total} site(s)…");
+                }
                 Ok(BgEvent::ScrapeOne(site)) => {
                     self.scrape_progress.0 += 1;
                     self.sites.push(site);
@@ -182,7 +183,7 @@ impl App {
                     let total = self.sites.len();
                     let with_emails = self.sites.iter().filter(|s| !s.emails.is_empty()).count();
                     self.status = format!(
-                        "Scraped {total} site(s); {with_emails} have emails. ←/→ pick email, Space toggles skip, F2 continues."
+                        "Scraped {total} site(s) — {with_emails} with emails.  ↑/↓ navigate · ←/→ pick email · Space skip · Ctrl+S compose"
                     );
                     break;
                 }
@@ -192,19 +193,17 @@ impl App {
                 }
                 Ok(BgEvent::SendDone) => {
                     self.bg_rx = None;
-                    self.screen = Screen::Done;
-                    let ok = self
-                        .send_results
-                        .iter()
-                        .filter(|r| r.status.is_ok())
-                        .count();
+                    let ok = self.send_results.iter().filter(|r| r.status.is_ok()).count();
+                    let total = self.send_results.len();
                     let log_path = self.write_csv_log();
-                    self.status = format!(
-                        "Done. {}/{} sent successfully. Log: {}  q/Esc to quit.",
-                        ok,
-                        self.send_results.len(),
-                        log_path,
-                    );
+                    let status = format!("Sent {ok}/{total} successfully.  Log → {log_path}");
+                    // Auto-reset to URL input
+                    self.screen = Screen::Urls;
+                    self.sites.clear();
+                    self.send_results.clear();
+                    self.scrape_progress = (0, 0);
+                    self.send_progress = (0, 0);
+                    self.status = status;
                     break;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -222,10 +221,7 @@ impl App {
         let path = format!("send_log_{date}.csv");
         let write = || -> std::io::Result<()> {
             let exists = std::path::Path::new(&path).exists();
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
             if !exists {
                 writeln!(f, "timestamp,url,email,status,error")?;
             }
@@ -253,21 +249,14 @@ impl App {
             Screen::Review => self.handle_review_key(key),
             Screen::Compose => self.handle_compose_key(key),
             Screen::Sending => self.handle_busy_key(key),
-            Screen::Done => self.handle_done_key(key),
         }
     }
 
-    fn handle_busy_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Esc {
-            self.status = "Working… please wait. Ctrl+Q to force quit.".into();
-        }
-    }
+    fn handle_busy_key(&mut self, _key: KeyEvent) {}
 
     fn handle_urls_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::F(2), _)
-            | (KeyCode::Char('s'), KeyModifiers::CONTROL)
-            | (KeyCode::Enter, KeyModifiers::CONTROL) => {
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.start_scrape();
             }
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
@@ -290,22 +279,20 @@ impl App {
     }
 
     fn handle_review_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.proceed_to_compose();
+            return;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.review_idx > 0 {
-                    self.review_idx -= 1;
-                }
+                if self.review_idx > 0 { self.review_idx -= 1; }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.review_idx + 1 < self.sites.len() {
-                    self.review_idx += 1;
-                }
+                if self.review_idx + 1 < self.sites.len() { self.review_idx += 1; }
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 if let Some(site) = self.sites.get_mut(self.review_idx) {
-                    if !site.emails.is_empty() && site.selected > 0 {
-                        site.selected -= 1;
-                    }
+                    if !site.emails.is_empty() && site.selected > 0 { site.selected -= 1; }
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
@@ -320,18 +307,8 @@ impl App {
                     site.skip = !site.skip;
                 }
             }
-            KeyCode::F(2) | KeyCode::Enter => {
-                let any_picked = self
-                    .sites
-                    .iter()
-                    .any(|s| !s.skip && !s.emails.is_empty());
-                if !any_picked {
-                    self.status = "Nothing to send — all sites skipped or empty.".into();
-                    return;
-                }
-                self.screen = Screen::Compose;
-                self.status =
-                    "Tab/BackTab cycle fields. Edit subject/body/CV/transcript. F2 to send. Esc back.".into();
+            KeyCode::Enter => {
+                self.proceed_to_compose();
             }
             KeyCode::Esc => {
                 self.screen = Screen::Urls;
@@ -343,9 +320,19 @@ impl App {
         }
     }
 
+    fn proceed_to_compose(&mut self) {
+        let any_picked = self.sites.iter().any(|s| !s.skip && !s.emails.is_empty());
+        if !any_picked {
+            self.status = "Nothing to send — all sites skipped or have no emails.".into();
+            return;
+        }
+        self.screen = Screen::Compose;
+        self.status = "Tab/BackTab cycle fields · Ctrl+S send · Esc back".into();
+    }
+
     fn handle_compose_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::F(2), _) => {
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                 self.start_send();
                 return;
             }
@@ -368,9 +355,7 @@ impl App {
             self.compose_focus,
             ComposeField::Subject | ComposeField::CvPath | ComposeField::TranscriptPath
         );
-        if is_single_line && key.code == KeyCode::Enter {
-            return;
-        }
+        if is_single_line && key.code == KeyCode::Enter { return; }
         let target: &mut TextArea<'static> = match self.compose_focus {
             ComposeField::Subject => &mut self.subject,
             ComposeField::Body => &mut self.body,
@@ -380,38 +365,46 @@ impl App {
         target.input(key);
     }
 
-    fn handle_done_key(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-            self.should_quit = true;
-        }
-    }
-
     fn start_scrape(&mut self) {
-        let urls: Vec<String> = self
+        let raw_urls: Vec<String> = self
             .urls_input
             .lines()
             .iter()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        if urls.is_empty() {
-            self.status = "No URLs to scrape.".into();
+        if raw_urls.is_empty() {
+            self.status = "No URLs entered.".into();
             return;
         }
 
         self.sites.clear();
-        self.scrape_progress = (0, urls.len());
+        self.scrape_progress = (0, raw_urls.len());
         self.screen = Screen::Scraping;
-        self.status = format!("Scraping {} site(s)…", urls.len());
+        self.status = format!("Expanding {} URL(s)…", raw_urls.len());
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.bg_rx = Some(rx);
 
         tokio::spawn(async move {
-            for url in urls {
+            // Phase 1: expand any directory URLs
+            let mut all_urls: Vec<String> = Vec::new();
+            for url in &raw_urls {
+                let expanded = scraper::try_expand_directory(url).await;
+                if !expanded.is_empty() {
+                    all_urls.extend(expanded);
+                } else {
+                    all_urls.push(url.clone());
+                }
+            }
+            let _ = tx.send(BgEvent::TotalUrls(all_urls.len()));
+
+            // Phase 2: scrape each URL for emails
+            for url in all_urls {
                 let site = match scraper::scrape_emails_for_url(&url).await {
-                    Ok(emails) => ScrapedSite {
+                    Ok((emails, company_name)) => ScrapedSite {
                         url: url.clone(),
+                        company_name,
                         emails,
                         selected: 0,
                         skip: false,
@@ -419,6 +412,7 @@ impl App {
                     },
                     Err(e) => ScrapedSite {
                         url: url.clone(),
+                        company_name: String::new(),
                         emails: Vec::new(),
                         selected: 0,
                         skip: true,
@@ -433,23 +427,9 @@ impl App {
 
     fn start_send(&mut self) {
         let subject = self.subject.lines().join(" ").trim().to_string();
-        let body = self.body.lines().join("\n");
-        let cv_path = self
-            .cv_path
-            .lines()
-            .first()
-            .cloned()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let transcript_path = self
-            .transcript_path
-            .lines()
-            .first()
-            .cloned()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let body_template = self.body.lines().join("\n");
+        let cv_path = self.cv_path.lines().first().cloned().unwrap_or_default().trim().to_string();
+        let transcript_path = self.transcript_path.lines().first().cloned().unwrap_or_default().trim().to_string();
 
         if subject.is_empty() {
             self.status = "Subject is empty.".into();
@@ -464,21 +444,23 @@ impl App {
             return;
         }
 
-        // Time window check
-        let hour = Local::now().hour();
+        // Timezone-aware send window check
+        let hour = current_hour_in_tz(&self.config.timezone);
         if hour < self.config.send_window_start || hour >= self.config.send_window_end {
             self.status = format!(
-                "Outside send window ({}:00–{}:00). Emails are sent only during these hours to maximize read rates.",
-                self.config.send_window_start, self.config.send_window_end
+                "Outside send window ({}:00–{}:00 {}).  Adjust config.toml to change the window.",
+                self.config.send_window_start,
+                self.config.send_window_end,
+                self.config.timezone,
             );
             return;
         }
 
-        let all_jobs: Vec<(String, String)> = self
+        let all_jobs: Vec<(String, String, String)> = self
             .sites
             .iter()
             .filter(|s| !s.skip && !s.emails.is_empty())
-            .map(|s| (s.url.clone(), s.emails[s.selected].clone()))
+            .map(|s| (s.url.clone(), s.emails[s.selected].clone(), s.company_name.clone()))
             .collect();
 
         if all_jobs.is_empty() {
@@ -486,26 +468,17 @@ impl App {
             return;
         }
 
-        // Daily limit
         let limit = self.config.daily_limit;
         let capped = all_jobs.len() > limit;
-        let jobs: Vec<(String, String)> = all_jobs.into_iter().take(limit).collect();
+        let jobs: Vec<(String, String, String)> = all_jobs.into_iter().take(limit).collect();
 
         self.send_results.clear();
         self.send_progress = (0, jobs.len());
         self.screen = Screen::Sending;
         self.status = if capped {
-            format!(
-                "Sending {} email(s) (capped at daily limit {})… delay: {}-{}s per email.",
-                jobs.len(), limit,
-                self.config.send_delay_min_secs, self.config.send_delay_max_secs,
-            )
+            format!("Sending {} email(s) (capped at {limit})…", jobs.len())
         } else {
-            format!(
-                "Sending {} email(s)… delay: {}-{}s per email.",
-                jobs.len(),
-                self.config.send_delay_min_secs, self.config.send_delay_max_secs,
-            )
+            format!("Sending {} email(s)…", jobs.len())
         };
 
         let smtp = self.config.smtp.clone();
@@ -515,16 +488,21 @@ impl App {
         self.bg_rx = Some(rx);
 
         tokio::spawn(async move {
-            for (i, (url, email)) in jobs.iter().enumerate() {
-                let res = mailer::send_email(&smtp, email, &subject, &body, &cv_path, &transcript_path).await;
-                let send_result = SendResult {
+            for (i, (url, email, company_name)) in jobs.iter().enumerate() {
+                let personalized_body = if company_name.is_empty() {
+                    body_template.clone()
+                } else {
+                    format!("Dear {company_name},\n\n{body_template}")
+                };
+                let res = mailer::send_email(
+                    &smtp, email, &subject, &personalized_body, &cv_path, &transcript_path,
+                ).await;
+                let _ = tx.send(BgEvent::SendOne(SendResult {
                     url: url.clone(),
                     email: email.clone(),
                     status: res.map_err(|e| e.to_string()),
-                };
-                let _ = tx.send(BgEvent::SendOne(send_result));
+                }));
                 if i + 1 < jobs.len() {
-                    // Compute delay before await so ThreadRng (non-Send) is dropped.
                     let secs = if delay_max > delay_min {
                         rand::thread_rng().gen_range(delay_min..=delay_max)
                     } else {
@@ -535,5 +513,15 @@ impl App {
             }
             let _ = tx.send(BgEvent::SendDone);
         });
+    }
+}
+
+fn current_hour_in_tz(timezone: &str) -> u32 {
+    if timezone.is_empty() || timezone.eq_ignore_ascii_case("local") {
+        return Local::now().hour();
+    }
+    match timezone.parse::<chrono_tz::Tz>() {
+        Ok(tz) => Local::now().with_timezone(&tz).hour(),
+        Err(_) => Local::now().hour(),
     }
 }

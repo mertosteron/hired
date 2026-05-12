@@ -31,6 +31,7 @@ anyhow = "1"
 thiserror = "1"
 rand = "0.8"
 chrono = "0.4"
+chrono-tz = "0.10"
 
 [profile.release]
 opt-level = 3

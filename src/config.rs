@@ -53,6 +53,9 @@ pub struct Config {
     /// Hour (0-23) at or after which no emails are sent.
     #[serde(default = "default_window_end")]
     pub send_window_end: u32,
+    /// IANA timezone name for the send window (e.g. "Europe/Istanbul"). "Local" uses system time.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
 }
 
 fn default_subject() -> String {
@@ -67,6 +70,7 @@ fn default_cv() -> String {
     "cv.pdf".to_string()
 }
 
+fn default_timezone() -> String { "Local".to_string() }
 fn default_delay_min() -> u64 { 60 }
 fn default_delay_max() -> u64 { 240 }
 fn default_daily_limit() -> usize { 50 }
@@ -103,6 +107,7 @@ impl Config {
                     daily_limit: default_daily_limit(),
                     send_window_start: default_window_start(),
                     send_window_end: default_window_end(),
+                    timezone: default_timezone(),
                     ..Default::default()
                 },
                 Some("config.toml not found — copy config.example.toml".into()),
