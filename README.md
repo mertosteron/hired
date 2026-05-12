@@ -1,125 +1,127 @@
 # Hired
 
-Terminal tabanlı bir iş/staj başvuru botu. Şirket websitelerini tarayarak HR email adreslerini bulur, CV ve transkriptini otomatik olarak gönderir.
+A terminal bot that finds HR email addresses on company websites and sends your CV automatically.
 
 ```
-URL listesi gir → Siteleri tara → Email seç → Mesaj yaz → Gönder
+Paste URLs → Scrape emails → Pick targets → Write message → Send
 ```
 
 ---
 
-## Ne yapar?
+## What it does
 
-1. Verdiğin şirket URL'lerini tarar (ana sayfa + iletişim/kariyer sayfaları).
-2. Bulunan email adreslerini sıralar ve hangisini kullanacağını seçmeni ister.
-3. Yazdığın mesajı, CV'ni ve (isteğe bağlı) transkriptini mail ile gönderir.
-4. Spama düşmemek için mailler arasında rastgele 1-4 dakika bekler.
-5. Gönderim sonuçlarını `send_log_YYYYMMDD.csv` dosyasına kaydeder.
+1. Scrapes each URL you provide (homepage + contact/careers sub-pages) for email addresses.
+2. Shows you the candidates per site so you can pick the right one.
+3. Sends your message with CV and (optionally) a transcript attached.
+4. Waits a random 1–4 minutes between emails to avoid spam filters.
+5. Saves every send result to `send_log_YYYYMMDD.csv`.
 
 ---
 
-## Kurulum
+## Install
 
-Rust 1.75+ gerekli. [rustup.rs](https://rustup.rs) ile yükleyebilirsin.
+Requires Rust 1.75+. Get it from [rustup.rs](https://rustup.rs).
 
 ```bash
 cargo install --path .
 ```
 
-Sonrasında herhangi bir terminalden `hired` yazarak başlatabilirsin.
+Then run `hired` from any terminal.
 
-Güncelleme için: `cargo install --path . --force`
-Kaldırmak için: `cargo uninstall hired`
+To update: `cargo install --path . --force`  
+To uninstall: `cargo uninstall hired`
 
-> `hired` komutu bulunamazsa `~/.cargo/bin` klasörünün PATH'te olduğunu kontrol et:
+> If `hired` is not found, add Cargo's bin directory to your PATH:
 > ```bash
 > export PATH="$HOME/.cargo/bin:$PATH"
 > ```
 
 ---
 
-## Yapılandırma
+## Configuration
 
 ```bash
 cp config.example.toml config.toml
 ```
 
-`config.toml` dosyasını aç ve şu alanları doldur:
+Fill in `config.toml`:
 
 ```toml
-default_subject = "Staj Başvurusu — Adın Soyadın"
-default_body    = """Merhaba, ..."""
+default_subject = "Internship Application — Your Name"
+default_body    = """Hello, ..."""
 cv_path         = "cv.pdf"
-transcript_path = "transkript.pdf"   # boş bırakırsan eklenmez
+transcript_path = "transcript.pdf"  # leave empty to skip
 
-send_delay_min_secs = 60    # mailler arası minimum bekleme (saniye)
-send_delay_max_secs = 240   # mailler arası maksimum bekleme (saniye)
-daily_limit         = 50    # oturum başına maksimum mail sayısı
-send_window_start   = 8     # kaçta gönderilmeye başlansın (saat, 0-23)
-send_window_end     = 22    # kaçta durulsun (saat, 0-23)
+send_delay_min_secs = 60    # minimum wait between emails (seconds)
+send_delay_max_secs = 240   # maximum wait between emails (seconds)
+daily_limit         = 50    # max emails per session
+send_window_start   = 8     # earliest hour to send (0–23)
+send_window_end     = 22    # latest hour to send (0–23)
 
 [smtp]
 server       = "smtp.gmail.com"
-port         = 587           # 587 = STARTTLS, 465 = TLS
-username     = "sen@gmail.com"
-password     = "uygulama-sifresi"   # Google App Password
-from_address = "sen@gmail.com"
-from_name    = "Adın Soyadın"
+port         = 587           # 587 = STARTTLS, 465 = implicit TLS
+username     = "you@gmail.com"
+password     = "app-password"
+from_address = "you@gmail.com"
+from_name    = "Your Name"
 ```
 
-> **Gmail kullanıyorsan:** normal şifren çalışmaz. Google hesabında
-> [App Password](https://support.google.com/accounts/answer/185833) oluştur ve onu kullan.
+> **Gmail users:** your normal password won't work. Generate an
+> [App Password](https://support.google.com/accounts/answer/185833) and use that instead.
 
-`config.toml` ve CV dosyaları **çalışma dizininde** olmalı. Uygulamayı bu klasörden başlat.
+Keep `config.toml` and your CV in the same directory and launch `hired` from there.
 
 ---
 
-## Kullanım
+## Usage
 
 ```bash
 hired
 ```
 
-### Ekranlar
+### Screens
 
-| Ekran | Tuşlar |
+| Screen | Keys |
 |---|---|
-| **URLs** | URL'leri alt alta yaz/yapıştır. `F2` taramayı başlatır. `Ctrl+L` → `urls.txt`'yi yükler. `Ctrl+Q` çıkış. |
-| **Scraping** | Otomatik ilerler, beklenir. |
-| **Review** | `↑/↓` site seç, `←/→` email adayı değiştir, `Space` dahil et/çıkar, `F2` devam et. `Esc` geri. |
-| **Compose** | `Tab/BackTab` alanlar arası geçiş (konu / mesaj / CV / transkript). `F2` gönderimi başlatır. `Esc` geri. |
-| **Sending** | Otomatik ilerler. Mailler arası rastgele bekleme uygulanır. |
-| **Done** | Sonuçlar gösterilir, `send_log_YYYYMMDD.csv` oluşturulur. `q` veya `Esc` ile çık. |
+| **URLs** | Type or paste one URL per line. `F2` starts scraping. `Ctrl+L` loads `urls.txt`. `Ctrl+Q` quits. |
+| **Scraping** | Runs automatically — just wait. |
+| **Review** | `↑/↓` select site · `←/→` cycle email candidates · `Space` include/skip · `F2` continue · `Esc` back. |
+| **Compose** | `Tab/BackTab` cycles fields (subject / body / CV path / transcript path). `F2` starts sending. `Esc` back. |
+| **Sending** | Runs automatically with a random delay between each email. |
+| **Done** | Per-site results shown. `send_log_YYYYMMDD.csv` written. `q` or `Esc` to exit. |
 
 ---
 
-## Nasıl çalışır?
+## How it works
 
-**Email tarama (5 aşamalı):**
-1. Ana sayfa HTML metni — regex ile email arama
-2. `mailto:` href linkleri
-3. İletişim/kariyer/hakkımızda alt sayfaları (8'e kadar)
-4. Tüm HTML element attribute'ları (`data-email` gibi gizli alanlar)
-5. `<script>` tag içerikleri (JS ile yüklenen siteler)
+**5-stage email discovery per site:**
 
-Bulunan adresler öncelik sırasına göre sıralanır: `hr@`, `kariyer@`, `jobs@` gibi adresler öne gelir. `noreply@` ve spam adresler elenir.
+1. Full HTML text scan — regex over the raw page source
+2. `mailto:` href attributes
+3. Up to 8 contact/careers/about sub-pages followed and scanned
+4. All HTML element attributes (catches `data-email` and similar hidden fields)
+5. `<script>` tag bodies (catches emails embedded in JavaScript)
 
-**Spam koruması:**
-- Mailler arası rastgele gecikme (varsayılan: 1–4 dakika)
-- Günlük gönderim limiti (varsayılan: 50)
-- Sadece belirtilen saat aralığında gönderim (varsayılan: 08:00–22:00)
+Found addresses are ranked by relevance — `hr@`, `careers@`, `jobs@` float to the top; `noreply@` and tracking domains are filtered out.
+
+**Spam protection:**
+
+- Random delay between emails (default: 1–4 minutes)
+- Per-session send limit (default: 50)
+- Time-window enforcement — no emails sent outside configured hours (default: 08:00–22:00)
 
 ---
 
-## Proje yapısı
+## Project layout
 
 ```
 src/
-├── main.rs     — giriş noktası, terminal kurulumu
-├── app.rs      — uygulama state makinesi ve event döngüsü
-├── ui.rs       — ratatui ile her ekranın çizimi
-├── scraper.rs  — 5 aşamalı email tarayıcı
-├── mailer.rs   — SMTP gönderici (CV + transkript eki)
-├── config.rs   — TOML config
-└── error.rs    — hata tipleri
+├── main.rs     — entry point, terminal setup, tokio runtime
+├── app.rs      — state machine and event loop
+├── ui.rs       — ratatui rendering for every screen
+├── scraper.rs  — 5-stage email scraper
+├── mailer.rs   — SMTP sender with CV + transcript attachments
+├── config.rs   — TOML config loader
+└── error.rs    — unified error type
 ```
