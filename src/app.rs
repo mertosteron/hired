@@ -100,7 +100,7 @@ impl App {
     pub fn new(config: Config, startup_warning: Option<String>) -> Self {
         let mut urls_input = TextArea::default();
         urls_input.set_placeholder_text(
-            "Paste one URL per line, e.g.\nhttps://example.com\nhttps://cryptoslate.com/companies/region/europe/",
+            "Paste one URL per line, e.g.\nhttps://example.com",
         );
 
         let mut subject = TextArea::from(vec![config.default_subject.clone()]);
