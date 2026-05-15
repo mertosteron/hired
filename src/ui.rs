@@ -107,7 +107,7 @@ fn render_urls(f: &mut Frame, area: Rect, app: &mut App) {
             Span::raw(" quit"),
         ]),
         Line::from(Span::styled(
-            "Directory URLs (e.g. cryptoslate.com/companies/region/europe/) are auto-expanded.",
+            "Directory URLs listing multiple companies are auto-expanded.",
             dim(),
         )),
     ])
