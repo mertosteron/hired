@@ -10,18 +10,39 @@ static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}").unwrap()
 });
 
+static FROMCHARCODE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"String\.fromCharCode\(\s*([0-9 ,]+)\s*\)").unwrap()
+});
+
+static B64_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"['"]([A-Za-z0-9+/]{12,}={0,2})['"]"#).unwrap()
+});
+
+static CSS_CONTENT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"content\s*:\s*['"]([^'"]+)['"]"#).unwrap()
+});
+
 const CONTACT_KEYWORDS: &[&str] = &[
     "contact", "kontakt", "about", "career", "careers", "jobs", "join",
     "hiring", "hr", "people", "team", "recruit", "talent", "apply",
     "iletisim", "iletişim", "hakkimizda", "hakkında", "kariyer",
     "bize-ulasin", "bize-ulaşın", "insan-kaynaklari", "staj", "intern",
-    "başvuru", "basvuru",
+    "başvuru", "basvuru", "reach", "connect", "support",
+];
+
+/// URL substrings worth a second-level dive on contact-style pages.
+const DEEP_CRAWL_KEYWORDS: &[&str] = &[
+    "contact", "iletisim", "iletişim", "reach", "connect", "support", "team",
 ];
 
 const JUNK_NEEDLES: &[&str] = &[
     "example.com", "yourdomain", "yourcompany", "domain.com",
-    "sentry.io", "sentry-next.wixpress.com", "wixpress.com",
     "u003c", "u002",
+];
+
+const TRANSACTIONAL_LOCALS: &[&str] = &[
+    "noreply", "no-reply", "donotreply", "do-not-reply",
+    "bounce", "bounces", "mailer-daemon", "mailerdaemon", "postmaster",
 ];
 
 const SOCIAL_DOMAINS: &[&str] = &[
@@ -41,15 +62,31 @@ fn looks_like_image(s: &str) -> bool {
         .any(|ext| l.ends_with(ext))
 }
 
+fn is_transactional(addr: &str) -> bool {
+    let lc = addr.to_ascii_lowercase();
+    let local = lc.split('@').next().unwrap_or("");
+    TRANSACTIONAL_LOCALS.iter().any(|t| local == *t || local.starts_with(&format!("{t}+")))
+}
+
 fn is_junk(addr: &str) -> bool {
     let lc = addr.to_ascii_lowercase();
     if looks_like_image(&lc) { return true; }
+    if is_transactional(&lc) { return true; }
     JUNK_NEEDLES.iter().any(|n| lc.contains(n))
 }
 
 fn is_social_or_utility(host: &str) -> bool {
     SOCIAL_DOMAINS.iter().any(|s| host == *s || host.ends_with(&format!(".{s}")))
 }
+
+fn push_emails(out: &mut HashSet<String>, text: &str) {
+    for m in EMAIL_RE.find_iter(text) {
+        let s = m.as_str();
+        if !is_junk(s) { out.insert(s.to_string()); }
+    }
+}
+
+// ---------- Stages 1–5: original extraction ----------
 
 fn extract_emails_from_text(html: &str) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -64,10 +101,7 @@ fn extract_emails_from_text(html: &str) -> HashSet<String> {
             }
         }
     }
-    for m in EMAIL_RE.find_iter(html) {
-        let s = m.as_str();
-        if !is_junk(s) { out.insert(s.to_string()); }
-    }
+    push_emails(&mut out, html);
     out
 }
 
@@ -78,10 +112,7 @@ fn extract_emails_from_attrs(html: &str) -> HashSet<String> {
         for el in doc.select(&sel) {
             for (_name, val) in el.value().attrs() {
                 if val.contains('@') {
-                    for m in EMAIL_RE.find_iter(val) {
-                        let s = m.as_str();
-                        if !is_junk(s) { out.insert(s.to_string()); }
-                    }
+                    push_emails(&mut out, val);
                 }
             }
         }
@@ -96,23 +127,205 @@ fn extract_emails_from_scripts(html: &str) -> HashSet<String> {
         for script in doc.select(&sel) {
             let text = script.text().collect::<String>();
             if text.contains('@') {
-                for m in EMAIL_RE.find_iter(&text) {
-                    let s = m.as_str();
-                    if !is_junk(s) { out.insert(s.to_string()); }
-                }
+                push_emails(&mut out, &text);
             }
         }
     }
     out
 }
 
+// ---------- Stage 6: deobfuscation ----------
+
+fn rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='M' | 'a'..='m' => ((c as u8) + 13) as char,
+            'N'..='Z' | 'n'..='z' => ((c as u8) - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+fn deobfuscate(s: &str) -> String {
+    let mut out = s.to_string();
+    // Common "[at]", "(at)", "{at}", " AT ", "&#64;", "&commat;", fullwidth.
+    let at_patterns = [
+        " [at] ", "[at]", "[AT]", " [AT] ",
+        " (at) ", "(at)", "(AT)", " (AT) ",
+        " {at} ", "{at}", "{AT}",
+        " at ", " AT ",
+        "&#64;", "&commat;",
+    ];
+    for p in at_patterns { out = out.replace(p, "@"); }
+    let dot_patterns = [
+        " [dot] ", "[dot]", "[DOT]", " [DOT] ",
+        " (dot) ", "(dot)", "(DOT)",
+        " {dot} ", "{dot}", "{DOT}",
+        " dot ", " DOT ",
+        "&#46;",
+    ];
+    for p in dot_patterns { out = out.replace(p, "."); }
+    out.replace('＠', "@").replace('．', ".").replace('・', ".")
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|b| !matches!(b, b'=' | b'\n' | b'\r' | b' ' | b'\t'))
+        .collect();
+    if bytes.len() < 4 { return None; }
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 2 { return None; }
+        let v0 = val(chunk[0])?;
+        let v1 = val(chunk[1])?;
+        out.push((v0 << 2) | (v1 >> 4));
+        if chunk.len() > 2 {
+            let v2 = val(chunk[2])?;
+            out.push(((v1 & 0xf) << 4) | (v2 >> 2));
+            if chunk.len() > 3 {
+                let v3 = val(chunk[3])?;
+                out.push(((v2 & 0x3) << 6) | v3);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn extract_emails_from_obfuscation(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+
+    // Textual obfuscation: [at], (at), unicode lookalikes, HTML entities.
+    let deob = deobfuscate(html);
+    push_emails(&mut out, &deob);
+
+    // ROT13.
+    let rotated = rot13(html);
+    push_emails(&mut out, &rotated);
+
+    // Reversed strings (some scripts embed reversed mailto, e.g. "moc.foo@bar").
+    let reversed: String = html.chars().rev().collect();
+    push_emails(&mut out, &reversed);
+
+    // String.fromCharCode(72,105,...) inside scripts.
+    for cap in FROMCHARCODE_RE.captures_iter(html) {
+        if let Some(nums) = cap.get(1) {
+            let decoded: String = nums
+                .as_str()
+                .split(',')
+                .filter_map(|n| n.trim().parse::<u32>().ok())
+                .filter_map(char::from_u32)
+                .collect();
+            push_emails(&mut out, &decoded);
+        }
+    }
+
+    // base64-encoded mailto blobs (atob('...')) and similar.
+    for cap in B64_RE.captures_iter(html) {
+        if let Some(b64) = cap.get(1) {
+            if let Some(decoded) = base64_decode(b64.as_str()) {
+                if let Ok(s) = std::str::from_utf8(&decoded) {
+                    if s.contains('@') {
+                        push_emails(&mut out, s);
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+// ---------- Stage 7: data-* attributes ----------
+
+fn extract_emails_from_data_attrs(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let doc = Html::parse_document(html);
+    let direct = ["data-email", "data-contact", "data-mail", "data-address"];
+    let Ok(sel) = Selector::parse("*") else { return out };
+
+    for el in doc.select(&sel) {
+        let mut user: Option<String> = None;
+        let mut domain: Option<String> = None;
+        for (name, val) in el.value().attrs() {
+            let lname = name.to_ascii_lowercase();
+            if direct.contains(&lname.as_str()) {
+                let v = val.trim();
+                push_emails(&mut out, v);
+                let deob = deobfuscate(v);
+                push_emails(&mut out, &deob);
+            } else if lname == "data-user" || lname == "data-local" {
+                user = Some(val.trim().to_string());
+            } else if lname == "data-domain" || lname == "data-host" {
+                domain = Some(val.trim().to_string());
+            }
+        }
+        if let (Some(u), Some(d)) = (user, domain) {
+            let candidate = format!("{u}@{d}");
+            if EMAIL_RE.is_match(&candidate) && !is_junk(&candidate) {
+                out.insert(candidate);
+            }
+        }
+    }
+    out
+}
+
+// ---------- Stage 8: CSS content injection ----------
+
+fn scan_css_text(text: &str, out: &mut HashSet<String>) {
+    for cap in CSS_CONTENT_RE.captures_iter(text) {
+        if let Some(c) = cap.get(1) {
+            push_emails(out, c.as_str());
+            let deob = deobfuscate(c.as_str());
+            push_emails(out, &deob);
+        }
+    }
+}
+
+fn extract_emails_from_css(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let doc = Html::parse_document(html);
+
+    if let Ok(sel) = Selector::parse("style") {
+        for el in doc.select(&sel) {
+            let text = el.text().collect::<String>();
+            scan_css_text(&text, &mut out);
+        }
+    }
+    if let Ok(sel) = Selector::parse("[style]") {
+        for el in doc.select(&sel) {
+            if let Some(s) = el.value().attr("style") {
+                scan_css_text(s, &mut out);
+            }
+        }
+    }
+    out
+}
+
+// ---------- Page scan: all stages combined ----------
+
 fn scan_page(html: &str) -> HashSet<String> {
     let mut found = HashSet::new();
-    found.extend(extract_emails_from_text(html));
-    found.extend(extract_emails_from_attrs(html));
-    found.extend(extract_emails_from_scripts(html));
+    found.extend(extract_emails_from_text(html));        // stage 1+2
+    found.extend(extract_emails_from_attrs(html));        // stage 3
+    found.extend(extract_emails_from_scripts(html));      // stage 4
+    found.extend(extract_emails_from_obfuscation(html));  // stage 6
+    found.extend(extract_emails_from_data_attrs(html));   // stage 7
+    found.extend(extract_emails_from_css(html));          // stage 8
     found
 }
+
+// ---------- Contact-page link extraction ----------
 
 fn extract_contact_links(html: &str, base: &Url) -> Vec<Url> {
     let doc = Html::parse_document(html);
@@ -162,7 +375,6 @@ pub fn extract_external_company_links(html: &str, base: &Url) -> Vec<String> {
     out
 }
 
-/// Fetch a URL and return external company links if it looks like a directory (≥3 distinct external domains).
 pub async fn try_expand_directory(input: &str) -> Vec<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() { return vec![]; }
@@ -186,7 +398,6 @@ pub async fn try_expand_directory(input: &str) -> Vec<String> {
     if links.len() >= 3 { links } else { vec![] }
 }
 
-/// Extract a human-readable company name from an HTML page or the URL itself.
 pub fn extract_company_name(html: &str, base_url: &str) -> String {
     let doc = Html::parse_document(html);
 
@@ -231,7 +442,6 @@ fn rank(addr: &str) -> i32 {
     for good in ["contact", "info", "hello", "office", "iletisim"] {
         if local.contains(good) { score -= 30; }
     }
-    if local == "no-reply" || local == "noreply" || local.starts_with("donot") { score += 100; }
     score
 }
 
@@ -256,19 +466,38 @@ pub async fn scrape_emails_for_url(input: &str) -> Result<(Vec<String>, String),
         .build()?;
 
     let mut found = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
 
     let resp = client.get(url.as_str()).send().await?;
     let final_url = resp.url().clone();
+    visited.insert(final_url.as_str().to_string());
     let body = resp.text().await?;
 
     let company_name = extract_company_name(&body, final_url.as_str());
     found.extend(scan_page(&body));
 
     let contact_links = extract_contact_links(&body, &final_url);
+    let mut deep_budget: usize = 6;
+
     for link in contact_links {
-        if let Ok(r) = client.get(link.as_str()).send().await {
-            if let Ok(text) = r.text().await {
-                found.extend(scan_page(&text));
+        if !visited.insert(link.as_str().to_string()) { continue }
+        let Ok(r) = client.get(link.as_str()).send().await else { continue };
+        let Ok(text) = r.text().await else { continue };
+        found.extend(scan_page(&text));
+
+        // Stage 9: drill one level deeper on contact-style URLs.
+        let link_low = link.as_str().to_ascii_lowercase();
+        if DEEP_CRAWL_KEYWORDS.iter().any(|k| link_low.contains(k)) && deep_budget > 0 {
+            let sublinks = extract_contact_links(&text, &link);
+            for sub in sublinks {
+                if deep_budget == 0 { break }
+                if !visited.insert(sub.as_str().to_string()) { continue }
+                if let Ok(r2) = client.get(sub.as_str()).send().await {
+                    if let Ok(t2) = r2.text().await {
+                        found.extend(scan_page(&t2));
+                    }
+                }
+                deep_budget -= 1;
             }
         }
     }

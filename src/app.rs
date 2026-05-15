@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::history::{SentEntry, SentHistory};
 use crate::mailer;
 use crate::scraper;
 use crate::ui;
@@ -9,6 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use rand::Rng;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
@@ -20,6 +22,8 @@ pub enum Screen {
     Review,
     Compose,
     Sending,
+    Done,
+    History,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +39,7 @@ pub struct ScrapedSite {
 #[derive(Debug, Clone)]
 pub struct SendResult {
     pub url: String,
+    pub company_name: String,
     pub email: String,
     pub status: Result<(), String>,
 }
@@ -65,15 +70,14 @@ impl ComposeField {
             ComposeField::TranscriptPath => ComposeField::Subject,
         }
     }
-
-    fn prev(self) -> Self {
-        self.next().next().next()
-    }
+    fn prev(self) -> Self { self.next().next().next() }
 }
 
 pub struct App {
     pub config: Config,
     pub screen: Screen,
+    /// Where to return when leaving the History screen.
+    pub history_return: Screen,
 
     pub urls_input: TextArea<'static>,
     pub subject: TextArea<'static>,
@@ -87,6 +91,10 @@ pub struct App {
 
     pub send_results: Vec<SendResult>,
 
+    pub history: SentHistory,
+    pub contacted: HashSet<String>,
+    pub history_idx: usize,
+
     pub status: String,
     pub bg_rx: Option<mpsc::UnboundedReceiver<BgEvent>>,
 
@@ -99,9 +107,7 @@ pub struct App {
 impl App {
     pub fn new(config: Config, startup_warning: Option<String>) -> Self {
         let mut urls_input = TextArea::default();
-        urls_input.set_placeholder_text(
-            "Paste one URL per line, e.g.\nhttps://example.com",
-        );
+        urls_input.set_placeholder_text("Paste one URL per line, e.g.\nhttps://example.com");
 
         let mut subject = TextArea::from(vec![config.default_subject.clone()]);
         subject.set_cursor_line_style(Default::default());
@@ -116,9 +122,13 @@ impl App {
         let mut transcript_path = TextArea::from(vec![config.transcript_path.clone()]);
         transcript_path.set_cursor_line_style(Default::default());
 
+        let history = SentHistory::load();
+        let contacted = history.contacted_set();
+
         Self {
             config,
             screen: Screen::Urls,
+            history_return: Screen::Urls,
             urls_input,
             subject,
             body,
@@ -128,9 +138,10 @@ impl App {
             sites: Vec::new(),
             review_idx: 0,
             send_results: Vec::new(),
-            status: startup_warning.unwrap_or_else(|| {
-                "Ready — paste URLs (one per line) or a directory URL.  Ctrl+S scrape · Ctrl+Q quit".into()
-            }),
+            history,
+            contacted,
+            history_idx: 0,
+            status: startup_warning.unwrap_or_else(|| "Paste URLs and press Ctrl+S to scrape.".into()),
             bg_rx: None,
             scrape_progress: (0, 0),
             send_progress: (0, 0),
@@ -164,6 +175,32 @@ impl App {
         Ok(())
     }
 
+    /// Wipe every transient piece of state so the URL screen is a clean slate.
+    pub fn reset_to_home(&mut self) {
+        self.screen = Screen::Urls;
+        self.urls_input = TextArea::default();
+        self.urls_input
+            .set_placeholder_text("Paste one URL per line, e.g.\nhttps://example.com");
+        self.sites.clear();
+        self.review_idx = 0;
+        self.send_results.clear();
+        self.scrape_progress = (0, 0);
+        self.send_progress = (0, 0);
+        self.compose_focus = ComposeField::Subject;
+        self.bg_rx = None;
+        // Reset compose fields to defaults so a new round starts fresh.
+        self.subject = TextArea::from(vec![self.config.default_subject.clone()]);
+        self.subject.set_cursor_line_style(Default::default());
+        self.body = TextArea::from(
+            self.config.default_body.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+        self.cv_path = TextArea::from(vec![self.config.cv_path.clone()]);
+        self.cv_path.set_cursor_line_style(Default::default());
+        self.transcript_path = TextArea::from(vec![self.config.transcript_path.clone()]);
+        self.transcript_path.set_cursor_line_style(Default::default());
+        self.status = "Paste URLs and press Ctrl+S to scrape.".into();
+    }
+
     fn drain_background(&mut self) {
         let Some(rx) = self.bg_rx.as_mut() else { return };
         loop {
@@ -182,28 +219,29 @@ impl App {
                     self.review_idx = 0;
                     let total = self.sites.len();
                     let with_emails = self.sites.iter().filter(|s| !s.emails.is_empty()).count();
-                    self.status = format!(
-                        "Scraped {total} site(s) — {with_emails} with emails.  ↑/↓ navigate · ←/→ pick email · Space skip · Ctrl+S compose"
-                    );
+                    self.status = format!("{with_emails}/{total} sites returned emails.");
                     break;
                 }
                 Ok(BgEvent::SendOne(res)) => {
                     self.send_progress.0 += 1;
+                    if res.status.is_ok() {
+                        let date = Local::now().format("%Y-%m-%d").to_string();
+                        self.contacted.insert(res.email.to_ascii_lowercase());
+                        self.history.record(SentEntry {
+                            email: res.email.clone(),
+                            date,
+                            url: res.url.clone(),
+                            company_name: res.company_name.clone(),
+                        });
+                        let _ = self.history.save();
+                    }
                     self.send_results.push(res);
                 }
                 Ok(BgEvent::SendDone) => {
                     self.bg_rx = None;
-                    let ok = self.send_results.iter().filter(|r| r.status.is_ok()).count();
-                    let total = self.send_results.len();
-                    let log_path = self.write_csv_log();
-                    let status = format!("Sent {ok}/{total} successfully.  Log → {log_path}");
-                    // Auto-reset to URL input
-                    self.screen = Screen::Urls;
-                    self.sites.clear();
-                    self.send_results.clear();
-                    self.scrape_progress = (0, 0);
-                    self.send_progress = (0, 0);
-                    self.status = status;
+                    let _ = self.write_csv_log();
+                    self.screen = Screen::Done;
+                    self.status = "Press Enter or Esc to return home.".into();
                     break;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -215,7 +253,7 @@ impl App {
         }
     }
 
-    fn write_csv_log(&self) -> String {
+    fn write_csv_log(&self) -> Option<String> {
         use std::io::Write;
         let date = Local::now().format("%Y%m%d").to_string();
         let path = format!("send_log_{date}.csv");
@@ -235,7 +273,7 @@ impl App {
             }
             Ok(())
         };
-        if write().is_ok() { path } else { "(log write failed)".into() }
+        write().ok().map(|_| path)
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -249,6 +287,8 @@ impl App {
             Screen::Review => self.handle_review_key(key),
             Screen::Compose => self.handle_compose_key(key),
             Screen::Sending => self.handle_busy_key(key),
+            Screen::Done => self.handle_done_key(key),
+            Screen::History => self.handle_history_key(key),
         }
     }
 
@@ -256,9 +296,7 @@ impl App {
 
     fn handle_urls_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.start_scrape();
-            }
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.start_scrape(),
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 match std::fs::read_to_string("urls.txt") {
                     Ok(s) => {
@@ -269,12 +307,43 @@ impl App {
                     Err(e) => self.status = format!("Cannot read urls.txt: {e}"),
                 }
             }
-            (KeyCode::Esc, _) => {
-                self.should_quit = true;
+            (KeyCode::Char('h'), KeyModifiers::NONE) => self.open_history(Screen::Urls),
+            (KeyCode::Char('H'), _) => self.open_history(Screen::Urls),
+            (KeyCode::Esc, _) => self.should_quit = true,
+            _ => { self.urls_input.input(key); }
+        }
+    }
+
+    fn open_history(&mut self, return_to: Screen) {
+        self.history_return = return_to;
+        self.history_idx = 0;
+        self.screen = Screen::History;
+        let n = self.history.entries.len();
+        self.status = if n == 0 {
+            "No sent history yet.".into()
+        } else {
+            format!("{n} sent address(es) on record.")
+        };
+    }
+
+    fn handle_history_key(&mut self, key: KeyEvent) {
+        let len = self.history.entries.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('H') => {
+                self.screen = self.history_return;
+                self.status = match self.history_return {
+                    Screen::Urls => "Paste URLs and press Ctrl+S to scrape.".into(),
+                    Screen::Review => "Reviewing scraped sites.".into(),
+                    _ => String::new(),
+                };
             }
-            _ => {
-                self.urls_input.input(key);
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.history_idx > 0 { self.history_idx -= 1; }
             }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if len > 0 && self.history_idx + 1 < len { self.history_idx += 1; }
+            }
+            _ => {}
         }
     }
 
@@ -290,12 +359,12 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.review_idx + 1 < self.sites.len() { self.review_idx += 1; }
             }
-            KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Left => {
                 if let Some(site) = self.sites.get_mut(self.review_idx) {
                     if !site.emails.is_empty() && site.selected > 0 { site.selected -= 1; }
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right => {
                 if let Some(site) = self.sites.get_mut(self.review_idx) {
                     if !site.emails.is_empty() && site.selected + 1 < site.emails.len() {
                         site.selected += 1;
@@ -307,14 +376,10 @@ impl App {
                     site.skip = !site.skip;
                 }
             }
-            KeyCode::Enter => {
-                self.proceed_to_compose();
-            }
+            KeyCode::Enter => self.proceed_to_compose(),
+            KeyCode::Char('H') | KeyCode::Char('h') => self.open_history(Screen::Review),
             KeyCode::Esc => {
-                self.screen = Screen::Urls;
-                self.sites.clear();
-                self.scrape_progress = (0, 0);
-                self.status = "Back to URL input.".into();
+                self.reset_to_home();
             }
             _ => {}
         }
@@ -327,28 +392,19 @@ impl App {
             return;
         }
         self.screen = Screen::Compose;
-        self.status = "Tab/BackTab cycle fields · Ctrl+S send · Esc back".into();
+        self.status = "Edit message, then Ctrl+S to send.".into();
     }
 
     fn handle_compose_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                self.start_send();
-                return;
-            }
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => { self.start_send(); return; }
             (KeyCode::Esc, _) => {
                 self.screen = Screen::Review;
                 self.status = "Back to review.".into();
                 return;
             }
-            (KeyCode::Tab, _) => {
-                self.compose_focus = self.compose_focus.next();
-                return;
-            }
-            (KeyCode::BackTab, _) => {
-                self.compose_focus = self.compose_focus.prev();
-                return;
-            }
+            (KeyCode::Tab, _) => { self.compose_focus = self.compose_focus.next(); return; }
+            (KeyCode::BackTab, _) => { self.compose_focus = self.compose_focus.prev(); return; }
             _ => {}
         }
         let is_single_line = matches!(
@@ -363,6 +419,13 @@ impl App {
             ComposeField::TranscriptPath => &mut self.transcript_path,
         };
         target.input(key);
+    }
+
+    fn handle_done_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => self.reset_to_home(),
+            _ => {}
+        }
     }
 
     fn start_scrape(&mut self) {
@@ -387,7 +450,6 @@ impl App {
         self.bg_rx = Some(rx);
 
         tokio::spawn(async move {
-            // Phase 1: expand any directory URLs
             let mut all_urls: Vec<String> = Vec::new();
             for url in &raw_urls {
                 let expanded = scraper::try_expand_directory(url).await;
@@ -399,7 +461,6 @@ impl App {
             }
             let _ = tx.send(BgEvent::TotalUrls(all_urls.len()));
 
-            // Phase 2: scrape each URL for emails
             for url in all_urls {
                 let site = match scraper::scrape_emails_for_url(&url).await {
                     Ok((emails, company_name)) => ScrapedSite {
@@ -444,11 +505,10 @@ impl App {
             return;
         }
 
-        // Timezone-aware send window check
         let hour = current_hour_in_tz(&self.config.timezone);
         if hour < self.config.send_window_start || hour >= self.config.send_window_end {
             self.status = format!(
-                "Outside send window ({}:00–{}:00 {}).  Adjust config.toml to change the window.",
+                "Outside send window ({}:00–{}:00 {}).",
                 self.config.send_window_start,
                 self.config.send_window_end,
                 self.config.timezone,
@@ -476,9 +536,9 @@ impl App {
         self.send_progress = (0, jobs.len());
         self.screen = Screen::Sending;
         self.status = if capped {
-            format!("Sending {} email(s) (capped at {limit})…", jobs.len())
+            format!("Sending {} (capped at {limit})…", jobs.len())
         } else {
-            format!("Sending {} email(s)…", jobs.len())
+            format!("Sending {}…", jobs.len())
         };
 
         let smtp = self.config.smtp.clone();
@@ -499,6 +559,7 @@ impl App {
                 ).await;
                 let _ = tx.send(BgEvent::SendOne(SendResult {
                     url: url.clone(),
+                    company_name: company_name.clone(),
                     email: email.clone(),
                     status: res.map_err(|e| e.to_string()),
                 }));

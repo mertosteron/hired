@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod error;
+mod history;
 mod mailer;
 mod scraper;
 mod ui;
