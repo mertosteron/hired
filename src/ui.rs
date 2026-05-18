@@ -45,7 +45,7 @@ fn key_hints(screen: Screen) -> Vec<(&'static str, &'static str)> {
         Screen::Urls => vec![
             ("Ctrl+S", "Scrape"),
             ("Ctrl+L", "Load file"),
-            ("H", "History"),
+            ("Ctrl+H", "History"),
             ("Ctrl+Q", "Quit"),
         ],
         Screen::Scraping => vec![
@@ -56,7 +56,7 @@ fn key_hints(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("←→", "Pick email"),
             ("Space", "Toggle skip"),
             ("Ctrl+S", "Compose"),
-            ("H", "History"),
+            ("Ctrl+H", "History"),
             ("Esc", "Home"),
         ],
         Screen::Compose => vec![

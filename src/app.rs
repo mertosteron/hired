@@ -307,8 +307,11 @@ impl App {
                     Err(e) => self.status = format!("Cannot read urls.txt: {e}"),
                 }
             }
-            (KeyCode::Char('h'), KeyModifiers::NONE) => self.open_history(Screen::Urls),
-            (KeyCode::Char('H'), _) => self.open_history(Screen::Urls),
+            (KeyCode::Char('h'), m) | (KeyCode::Char('H'), m)
+                if m.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_history(Screen::Urls)
+            }
             (KeyCode::Esc, _) => self.should_quit = true,
             _ => { self.urls_input.input(key); }
         }
@@ -328,15 +331,18 @@ impl App {
 
     fn handle_history_key(&mut self, key: KeyEvent) {
         let len = self.history.entries.len();
+        let is_ctrl_h = matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if is_ctrl_h || matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            self.screen = self.history_return;
+            self.status = match self.history_return {
+                Screen::Urls => "Paste URLs and press Ctrl+S to scrape.".into(),
+                Screen::Review => "Reviewing scraped sites.".into(),
+                _ => String::new(),
+            };
+            return;
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('H') => {
-                self.screen = self.history_return;
-                self.status = match self.history_return {
-                    Screen::Urls => "Paste URLs and press Ctrl+S to scrape.".into(),
-                    Screen::Review => "Reviewing scraped sites.".into(),
-                    _ => String::new(),
-                };
-            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.history_idx > 0 { self.history_idx -= 1; }
             }
@@ -350,6 +356,12 @@ impl App {
     fn handle_review_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.proceed_to_compose();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.open_history(Screen::Review);
             return;
         }
         match key.code {
@@ -377,7 +389,6 @@ impl App {
                 }
             }
             KeyCode::Enter => self.proceed_to_compose(),
-            KeyCode::Char('H') | KeyCode::Char('h') => self.open_history(Screen::Review),
             KeyCode::Esc => {
                 self.reset_to_home();
             }
