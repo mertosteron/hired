@@ -305,23 +305,26 @@ fn render_compose(f: &mut Frame, area: Rect, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(3), // subject
+            Constraint::Length(3), // greeting
+            Constraint::Min(5),    // body
+            Constraint::Length(3), // cv path
+            Constraint::Length(3), // transcript path
         ])
         .split(area);
 
     let foc = app.compose_focus;
     app.subject.set_block(card("subject", foc == ComposeField::Subject));
+    app.greeting.set_block(card("greeting  ({company} → company name)", foc == ComposeField::Greeting));
     app.body.set_block(card("body", foc == ComposeField::Body));
     app.cv_path.set_block(card("cv path", foc == ComposeField::CvPath));
     app.transcript_path.set_block(card("transcript path (optional)", foc == ComposeField::TranscriptPath));
 
     f.render_widget(&app.subject, chunks[0]);
-    f.render_widget(&app.body, chunks[1]);
-    f.render_widget(&app.cv_path, chunks[2]);
-    f.render_widget(&app.transcript_path, chunks[3]);
+    f.render_widget(&app.greeting, chunks[1]);
+    f.render_widget(&app.body, chunks[2]);
+    f.render_widget(&app.cv_path, chunks[3]);
+    f.render_widget(&app.transcript_path, chunks[4]);
 }
 
 fn card(title: &str, focused: bool) -> Block<'_> {

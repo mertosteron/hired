@@ -35,6 +35,17 @@ const DEEP_CRAWL_KEYWORDS: &[&str] = &[
     "contact", "iletisim", "iletişim", "reach", "connect", "support", "team",
 ];
 
+/// Paths to try directly on every domain, even if nothing in the nav links to them.
+const WELL_KNOWN_CONTACT_PATHS: &[&str] = &[
+    "/contact", "/contacts", "/contact-us", "/contactus",
+    "/iletisim", "/iletişim",
+    "/about", "/about-us",
+    "/jobs", "/careers", "/career",
+    "/work-with-us", "/join-us",
+    "/hiring", "/team", "/people",
+    "/kariyer", "/insan-kaynaklari",
+];
+
 const JUNK_NEEDLES: &[&str] = &[
     "example.com", "yourdomain", "yourcompany", "domain.com",
     "u003c", "u002",
@@ -500,6 +511,17 @@ pub async fn scrape_emails_for_url(input: &str) -> Result<(Vec<String>, String),
                 deep_budget -= 1;
             }
         }
+    }
+
+    // Stage 10: probe well-known contact paths directly. Some sites bury contact info
+    // behind paths that aren't linked from the home page's nav/footer.
+    for path in WELL_KNOWN_CONTACT_PATHS {
+        let Ok(candidate) = final_url.join(path) else { continue };
+        if !visited.insert(candidate.as_str().to_string()) { continue }
+        let Ok(r) = client.get(candidate.as_str()).send().await else { continue };
+        if !r.status().is_success() { continue }
+        let Ok(text) = r.text().await else { continue };
+        found.extend(scan_page(&text));
     }
 
     let mut emails: Vec<String> = found.into_iter().collect();

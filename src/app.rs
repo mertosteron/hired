@@ -56,6 +56,7 @@ pub enum BgEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeField {
     Subject,
+    Greeting,
     Body,
     CvPath,
     TranscriptPath,
@@ -64,14 +65,26 @@ pub enum ComposeField {
 impl ComposeField {
     fn next(self) -> Self {
         match self {
-            ComposeField::Subject => ComposeField::Body,
+            ComposeField::Subject => ComposeField::Greeting,
+            ComposeField::Greeting => ComposeField::Body,
             ComposeField::Body => ComposeField::CvPath,
             ComposeField::CvPath => ComposeField::TranscriptPath,
             ComposeField::TranscriptPath => ComposeField::Subject,
         }
     }
-    fn prev(self) -> Self { self.next().next().next() }
+    fn prev(self) -> Self {
+        match self {
+            ComposeField::Subject => ComposeField::TranscriptPath,
+            ComposeField::Greeting => ComposeField::Subject,
+            ComposeField::Body => ComposeField::Greeting,
+            ComposeField::CvPath => ComposeField::Body,
+            ComposeField::TranscriptPath => ComposeField::CvPath,
+        }
+    }
 }
+
+/// Default greeting template. `{company}` is substituted at send time.
+pub const DEFAULT_GREETING: &str = "Dear {company},";
 
 pub struct App {
     pub config: Config,
@@ -81,6 +94,7 @@ pub struct App {
 
     pub urls_input: TextArea<'static>,
     pub subject: TextArea<'static>,
+    pub greeting: TextArea<'static>,
     pub body: TextArea<'static>,
     pub cv_path: TextArea<'static>,
     pub transcript_path: TextArea<'static>,
@@ -112,6 +126,9 @@ impl App {
         let mut subject = TextArea::from(vec![config.default_subject.clone()]);
         subject.set_cursor_line_style(Default::default());
 
+        let mut greeting = TextArea::from(vec![DEFAULT_GREETING.to_string()]);
+        greeting.set_cursor_line_style(Default::default());
+
         let body = TextArea::from(
             config.default_body.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
         );
@@ -131,6 +148,7 @@ impl App {
             history_return: Screen::Urls,
             urls_input,
             subject,
+            greeting,
             body,
             cv_path,
             transcript_path,
@@ -191,6 +209,8 @@ impl App {
         // Reset compose fields to defaults so a new round starts fresh.
         self.subject = TextArea::from(vec![self.config.default_subject.clone()]);
         self.subject.set_cursor_line_style(Default::default());
+        self.greeting = TextArea::from(vec![DEFAULT_GREETING.to_string()]);
+        self.greeting.set_cursor_line_style(Default::default());
         self.body = TextArea::from(
             self.config.default_body.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
         );
@@ -420,11 +440,15 @@ impl App {
         }
         let is_single_line = matches!(
             self.compose_focus,
-            ComposeField::Subject | ComposeField::CvPath | ComposeField::TranscriptPath
+            ComposeField::Subject
+                | ComposeField::Greeting
+                | ComposeField::CvPath
+                | ComposeField::TranscriptPath
         );
         if is_single_line && key.code == KeyCode::Enter { return; }
         let target: &mut TextArea<'static> = match self.compose_focus {
             ComposeField::Subject => &mut self.subject,
+            ComposeField::Greeting => &mut self.greeting,
             ComposeField::Body => &mut self.body,
             ComposeField::CvPath => &mut self.cv_path,
             ComposeField::TranscriptPath => &mut self.transcript_path,
@@ -499,6 +523,7 @@ impl App {
 
     fn start_send(&mut self) {
         let subject = self.subject.lines().join(" ").trim().to_string();
+        let greeting_template = self.greeting.lines().join(" ").trim().to_string();
         let body_template = self.body.lines().join("\n");
         let cv_path = self.cv_path.lines().first().cloned().unwrap_or_default().trim().to_string();
         let transcript_path = self.transcript_path.lines().first().cloned().unwrap_or_default().trim().to_string();
@@ -559,30 +584,59 @@ impl App {
         self.bg_rx = Some(rx);
 
         tokio::spawn(async move {
-            for (i, (url, email, company_name)) in jobs.iter().enumerate() {
-                let personalized_body = if company_name.is_empty() {
-                    body_template.clone()
-                } else {
-                    format!("Dear {company_name},\n\n{body_template}")
-                };
-                let res = mailer::send_email(
-                    &smtp, email, &subject, &personalized_body, &cv_path, &transcript_path,
-                ).await;
-                let _ = tx.send(BgEvent::SendOne(SendResult {
-                    url: url.clone(),
-                    company_name: company_name.clone(),
-                    email: email.clone(),
-                    status: res.map_err(|e| e.to_string()),
-                }));
-                if i + 1 < jobs.len() {
+            // Schedule every send up front. Each job gets an absolute deadline
+            // (start + cumulative delay); a dedicated task wakes at that deadline
+            // and sends, so a slow or hung send cannot push later sends back.
+            use tokio::task::JoinSet;
+            use tokio::time::{sleep_until, Instant as TokioInstant};
+
+            let start = TokioInstant::now();
+            let mut cumulative_secs: u64 = 0;
+            let mut set: JoinSet<()> = JoinSet::new();
+
+            for (i, (url, email, company_name)) in jobs.into_iter().enumerate() {
+                if i > 0 {
                     let secs = if delay_max > delay_min {
                         rand::thread_rng().gen_range(delay_min..=delay_max)
                     } else {
                         delay_min
                     };
-                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    cumulative_secs = cumulative_secs.saturating_add(secs);
                 }
+                let scheduled_at = start + Duration::from_secs(cumulative_secs);
+
+                let tx_c = tx.clone();
+                let smtp_c = smtp.clone();
+                let subject_c = subject.clone();
+                let greeting_c = greeting_template.clone();
+                let body_c = body_template.clone();
+                let cv_c = cv_path.clone();
+                let trans_c = transcript_path.clone();
+
+                set.spawn(async move {
+                    sleep_until(scheduled_at).await;
+
+                    let greeting_rendered = greeting_c.replace("{company}", &company_name);
+                    let final_body = if greeting_rendered.trim().is_empty() {
+                        body_c
+                    } else {
+                        format!("{greeting_rendered}\n\n{body_c}")
+                    };
+
+                    let res = mailer::send_email(
+                        &smtp_c, &email, &subject_c, &final_body, &cv_c, &trans_c,
+                    ).await;
+                    let _ = tx_c.send(BgEvent::SendOne(SendResult {
+                        url,
+                        company_name,
+                        email,
+                        status: res.map_err(|e| e.to_string()),
+                    }));
+                });
             }
+
+            // Drain every scheduled send so SendDone fires only after all timers complete.
+            while set.join_next().await.is_some() {}
             let _ = tx.send(BgEvent::SendDone);
         });
     }
