@@ -8,6 +8,10 @@ description = "Terminal bot that scrapes company sites for HR emails and sends a
 name = "hired"
 path = "src/main.rs"
 
+[[bin]]
+name = "verify"
+path = "src/bin/verify.rs"
+
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
@@ -33,6 +37,9 @@ thiserror = "1"
 rand = "0.8"
 chrono = "0.4"
 chrono-tz = "0.10"
+
+log = "0.4"
+env_logger = "0.11"
 
 [profile.release]
 opt-level = 3

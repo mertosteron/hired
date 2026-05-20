@@ -2,12 +2,16 @@ use crate::error::BotError;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use scraper::{Html, Selector};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use url::Url;
 
 static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}").unwrap()
+});
+
+static SITEMAP_LOC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)<loc[^>]*>\s*([^<\s]+)\s*</loc>").unwrap()
 });
 
 static FROMCHARCODE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -38,22 +42,27 @@ const DEEP_CRAWL_KEYWORDS: &[&str] = &[
 /// Paths to try directly on every domain, even if nothing in the nav links to them.
 const WELL_KNOWN_CONTACT_PATHS: &[&str] = &[
     "/contact", "/contacts", "/contact-us", "/contactus",
-    "/iletisim", "/iletişim",
-    "/about", "/about-us",
-    "/jobs", "/careers", "/career",
-    "/work-with-us", "/join-us",
-    "/hiring", "/team", "/people",
-    "/kariyer", "/insan-kaynaklari",
+    "/iletisim", "/iletişim", "/iletisim-bilgileri", "/bize-ulasin",
+    "/about", "/about-us", "/about/contact",
+    "/hakkimizda", "/hakkinda", "/hakkımızda",
+    "/jobs", "/careers", "/career", "/career/contact",
+    "/work-with-us", "/join-us", "/join",
+    "/hiring", "/team", "/people", "/ekibimiz", "/ekip",
+    "/kariyer", "/kariyer/iletisim", "/insan-kaynaklari", "/ik",
+    "/impressum", "/imprint", "/legal",
+    "/staj", "/intern", "/internship",
 ];
 
 const JUNK_NEEDLES: &[&str] = &[
     "example.com", "yourdomain", "yourcompany", "domain.com",
-    "u003c", "u002",
+    "u003c", "u003e", "u002", "x3c", "x3e",
 ];
 
+/// Local-parts that we drop entirely — never useful for a job application.
 const TRANSACTIONAL_LOCALS: &[&str] = &[
     "noreply", "no-reply", "donotreply", "do-not-reply",
     "bounce", "bounces", "mailer-daemon", "mailerdaemon", "postmaster",
+    "unsubscribe", "support", "help",
 ];
 
 const SOCIAL_DOMAINS: &[&str] = &[
@@ -98,23 +107,6 @@ fn push_emails(out: &mut HashSet<String>, text: &str) {
 }
 
 // ---------- Stages 1–5: original extraction ----------
-
-fn extract_emails_from_text(html: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let doc = Html::parse_document(html);
-    if let Ok(sel) = Selector::parse(r#"a[href^="mailto:"]"#) {
-        for a in doc.select(&sel) {
-            if let Some(href) = a.value().attr("href") {
-                let addr = href.trim_start_matches("mailto:").split(['?', '#']).next().unwrap_or("").trim();
-                if !addr.is_empty() && EMAIL_RE.is_match(addr) && !is_junk(addr) {
-                    out.insert(addr.to_string());
-                }
-            }
-        }
-    }
-    push_emails(&mut out, html);
-    out
-}
 
 fn extract_emails_from_attrs(html: &str) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -220,13 +212,22 @@ fn extract_emails_from_obfuscation(html: &str) -> HashSet<String> {
     let deob = deobfuscate(html);
     push_emails(&mut out, &deob);
 
-    // ROT13.
+    // ROT13 and reversed strings: high-recall but high-false-positive (any
+    // long alphabetic run can decode to a syntactically valid email). Only
+    // keep results whose host is also literally present in the source HTML,
+    // which proves the decode was a real obfuscated address.
+    let mut conservative: HashSet<String> = HashSet::new();
     let rotated = rot13(html);
-    push_emails(&mut out, &rotated);
-
-    // Reversed strings (some scripts embed reversed mailto, e.g. "moc.foo@bar").
+    push_emails(&mut conservative, &rotated);
     let reversed: String = html.chars().rev().collect();
-    push_emails(&mut out, &reversed);
+    push_emails(&mut conservative, &reversed);
+    let html_low = html.to_ascii_lowercase();
+    for addr in conservative {
+        let host = addr.split('@').nth(1).unwrap_or("").to_ascii_lowercase();
+        if !host.is_empty() && html_low.contains(&host) {
+            out.insert(addr);
+        }
+    }
 
     // String.fromCharCode(72,105,...) inside scripts.
     for cap in FROMCHARCODE_RE.captures_iter(html) {
@@ -323,18 +324,184 @@ fn extract_emails_from_css(html: &str) -> HashSet<String> {
     out
 }
 
+// ---------- Stage 11: Cloudflare email obfuscation ----------
+
+/// Decode a Cloudflare `data-cfemail` / `email-protection#<hex>` payload.
+///
+/// Algorithm: the first byte is the XOR key; every subsequent byte is the
+/// next character of the email after XOR-ing it with the key.
+pub fn decode_cfemail(hex: &str) -> Option<String> {
+    let hex = hex.trim();
+    if hex.len() < 4 || hex.len() % 2 != 0 { return None; }
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect();
+    let bytes = bytes?;
+    let key = bytes[0];
+    let mut out = String::with_capacity(bytes.len() - 1);
+    for &b in &bytes[1..] {
+        let c = b ^ key;
+        if !c.is_ascii() { return None; }
+        out.push(c as char);
+    }
+    if EMAIL_RE.is_match(&out) { Some(out) } else { None }
+}
+
+fn extract_emails_from_cloudflare(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let doc = Html::parse_document(html);
+
+    // (a) data-cfemail attribute on any element (the visible link form).
+    if let Ok(sel) = Selector::parse("[data-cfemail]") {
+        for el in doc.select(&sel) {
+            if let Some(hex) = el.value().attr("data-cfemail") {
+                if let Some(addr) = decode_cfemail(hex) {
+                    if !is_junk(&addr) { out.insert(addr); }
+                }
+            }
+        }
+    }
+
+    // (b) /cdn-cgi/l/email-protection#<hex> in any href (fallback link form).
+    if let Ok(sel) = Selector::parse(r#"a[href*="/cdn-cgi/l/email-protection"]"#) {
+        for a in doc.select(&sel) {
+            if let Some(href) = a.value().attr("href") {
+                if let Some(hex) = href.split('#').nth(1) {
+                    if let Some(addr) = decode_cfemail(hex) {
+                        if !is_junk(&addr) { out.insert(addr); }
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
 // ---------- Page scan: all stages combined ----------
 
-fn scan_page(html: &str) -> HashSet<String> {
-    let mut found = HashSet::new();
-    found.extend(extract_emails_from_text(html));        // stage 1+2
-    found.extend(extract_emails_from_attrs(html));        // stage 3
-    found.extend(extract_emails_from_scripts(html));      // stage 4
-    found.extend(extract_emails_from_obfuscation(html));  // stage 6
-    found.extend(extract_emails_from_data_attrs(html));   // stage 7
-    found.extend(extract_emails_from_css(html));          // stage 8
-    found
+/// Provenance label for a single email finding. Cheap to clone — &'static str.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FindingMethod {
+    Mailto,
+    PlainText,
+    Attribute,
+    Script,
+    Obfuscated,
+    DataAttr,
+    Css,
+    Cloudflare,
 }
+
+impl FindingMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FindingMethod::Mailto => "mailto:",
+            FindingMethod::PlainText => "plain text",
+            FindingMethod::Attribute => "attribute",
+            FindingMethod::Script => "script",
+            FindingMethod::Obfuscated => "obfuscated",
+            FindingMethod::DataAttr => "data-*",
+            FindingMethod::Css => "css content",
+            FindingMethod::Cloudflare => "cloudflare cfemail",
+        }
+    }
+}
+
+/// One discovered email with provenance — used by the verify harness.
+#[derive(Debug, Clone)]
+pub struct EmailFinding {
+    pub email: String,
+    pub source_url: String,
+    pub method: FindingMethod,
+    pub category: EmailCategory,
+}
+
+/// Coarse category, ordered to mirror application-priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailCategory {
+    /// kariyer/jobs/hr/recruitment/hiring/ik
+    Careers,
+    /// info/iletisim/contact/hello/office
+    General,
+    /// everything else legitimate (personal addresses, departments, etc.)
+    Other,
+}
+
+impl EmailCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmailCategory::Careers => "careers",
+            EmailCategory::General => "general",
+            EmailCategory::Other => "other",
+        }
+    }
+
+    pub fn from_email(addr: &str) -> Self {
+        let lc = addr.to_ascii_lowercase();
+        let local = lc.split('@').next().unwrap_or("");
+        for k in ["hr", "jobs", "career", "careers", "recruit", "hiring", "talent",
+                  "people", "kariyer", "ik", "insankaynak", "staj", "intern"] {
+            if local.contains(k) { return EmailCategory::Careers; }
+        }
+        for k in ["info", "contact", "iletisim", "hello", "office", "merhaba"] {
+            if local.contains(k) { return EmailCategory::General; }
+        }
+        EmailCategory::Other
+    }
+}
+
+/// Run every stage on `html` and return a (method, set-of-emails) map.
+fn scan_page_provenanced(html: &str) -> HashMap<FindingMethod, HashSet<String>> {
+    let mut out: HashMap<FindingMethod, HashSet<String>> = HashMap::new();
+
+    // Stage 1 (mailto:) is folded into extract_emails_from_text already,
+    // but we re-scan mailto links separately to label them precisely.
+    let doc = Html::parse_document(html);
+    if let Ok(sel) = Selector::parse(r#"a[href^="mailto:"]"#) {
+        let entry = out.entry(FindingMethod::Mailto).or_default();
+        for a in doc.select(&sel) {
+            if let Some(href) = a.value().attr("href") {
+                let addr = href.trim_start_matches("mailto:")
+                    .split(['?', '#'])
+                    .next().unwrap_or("").trim();
+                if !addr.is_empty() && EMAIL_RE.is_match(addr) && !is_junk(addr) {
+                    entry.insert(addr.to_string());
+                }
+            }
+        }
+    }
+
+    // For plain text we re-run the body scan but exclude anything already found
+    // as a mailto so the label stays accurate.
+    let mailto_set = out.get(&FindingMethod::Mailto).cloned().unwrap_or_default();
+    let mut plain = HashSet::new();
+    push_emails(&mut plain, html);
+    for e in &mailto_set { plain.remove(e); }
+    if !plain.is_empty() { out.insert(FindingMethod::PlainText, plain); }
+
+    let attrs = extract_emails_from_attrs(html);
+    if !attrs.is_empty() { out.insert(FindingMethod::Attribute, attrs); }
+
+    let scripts = extract_emails_from_scripts(html);
+    if !scripts.is_empty() { out.insert(FindingMethod::Script, scripts); }
+
+    let obf = extract_emails_from_obfuscation(html);
+    if !obf.is_empty() { out.insert(FindingMethod::Obfuscated, obf); }
+
+    let data = extract_emails_from_data_attrs(html);
+    if !data.is_empty() { out.insert(FindingMethod::DataAttr, data); }
+
+    let css = extract_emails_from_css(html);
+    if !css.is_empty() { out.insert(FindingMethod::Css, css); }
+
+    let cf = extract_emails_from_cloudflare(html);
+    if !cf.is_empty() { out.insert(FindingMethod::Cloudflare, cf); }
+
+    out
+}
+
 
 // ---------- Contact-page link extraction ----------
 
@@ -443,6 +610,8 @@ pub fn extract_company_name(html: &str, base_url: &str) -> String {
     "the company".to_string()
 }
 
+/// Lower score sorts earlier. Penalize transactional/off-domain, reward
+/// careers/general buckets.
 fn rank(addr: &str) -> i32 {
     let lc = addr.to_ascii_lowercase();
     let local = lc.split('@').next().unwrap_or("");
@@ -456,8 +625,149 @@ fn rank(addr: &str) -> i32 {
     score
 }
 
-/// Scrape a single company URL for contact emails. Returns (emails, company_name).
-pub async fn scrape_emails_for_url(input: &str) -> Result<(Vec<String>, String), BotError> {
+/// Score an email *in the context of* the base URL it was scraped from.
+/// Adds an off-domain penalty so addresses whose host doesn't match the site
+/// are still kept but sorted lower than addresses on the company's own domain.
+fn rank_with_context(addr: &str, base_host: &str) -> i32 {
+    let mut score = rank(addr);
+    if is_off_domain(addr, base_host) { score += 25; }
+    score
+}
+
+/// True when the email's host doesn't appear to belong to the company's
+/// own domain. Two-label suffix match handles `foo.com` and `foo.com.tr`.
+fn is_off_domain(addr: &str, base_host: &str) -> bool {
+    let lc = addr.to_ascii_lowercase();
+    let Some(email_host) = lc.split('@').nth(1) else { return false };
+    let base = base_host.trim_start_matches("www.").to_ascii_lowercase();
+    if base.is_empty() { return false; }
+    if email_host == base || email_host.ends_with(&format!(".{base}")) { return false; }
+    // Also accept "subdomain.x" → "x" registrable-domain match.
+    let last_two = |h: &str| -> String {
+        let parts: Vec<&str> = h.split('.').collect();
+        if parts.len() >= 2 {
+            parts[parts.len() - 2..].join(".")
+        } else {
+            h.to_string()
+        }
+    };
+    last_two(email_host) != last_two(&base)
+}
+
+// ---------- Sitemap discovery ----------
+
+/// Fetch `/sitemap.xml` and return contact-flavored same-host URLs. Capped
+/// so a 5,000-entry sitemap can't blow up the crawl budget.
+async fn discover_sitemap_pages(
+    client: &reqwest::Client,
+    base: &Url,
+) -> Vec<Url> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let Ok(sm_url) = base.join("/sitemap.xml") else { return out };
+    let Ok(resp) = client.get(sm_url.as_str()).send().await else { return out };
+    if !resp.status().is_success() { return out }
+    let Ok(body) = resp.text().await else { return out };
+
+    let base_host = base.host_str().unwrap_or("");
+    for cap in SITEMAP_LOC_RE.captures_iter(&body) {
+        let Some(loc) = cap.get(1) else { continue };
+        let loc = loc.as_str().trim();
+        let Ok(u) = Url::parse(loc) else { continue };
+        if u.host_str() != Some(base_host) { continue }
+        let path_low = u.path().to_ascii_lowercase();
+        let interesting = CONTACT_KEYWORDS.iter().any(|k| path_low.contains(k));
+        if !interesting { continue }
+        let key = u.as_str().to_string();
+        if seen.insert(key) { out.push(u); }
+        if out.len() >= 20 { break }
+    }
+    out
+}
+
+/// Result of a single-site scrape with full provenance — used by the verify
+/// harness and by the bot's compatibility shim.
+#[derive(Debug, Clone)]
+pub struct ScrapeReport {
+    pub company_name: String,
+    pub final_url: String,
+    pub findings: Vec<EmailFinding>,
+}
+
+impl ScrapeReport {
+    /// Best email — first by application priority (careers > general > other),
+    /// then by on-domain-ness, then alphabetically.
+    pub fn primary(&self) -> Option<&EmailFinding> { self.findings.first() }
+
+    /// Just the email strings, sorted in priority order.
+    pub fn emails(&self) -> Vec<String> {
+        self.findings.iter().map(|f| f.email.clone()).collect()
+    }
+}
+
+fn merge_findings(
+    out: &mut HashMap<String, EmailFinding>,
+    page_url: &str,
+    base_host: &str,
+    page_results: HashMap<FindingMethod, HashSet<String>>,
+) {
+    // Method preference: mailto beats everything (most authoritative),
+    // then cloudflare, then plain text, then everything else.
+    fn method_rank(m: FindingMethod) -> u8 {
+        match m {
+            FindingMethod::Mailto => 0,
+            FindingMethod::Cloudflare => 1,
+            FindingMethod::PlainText => 2,
+            FindingMethod::DataAttr => 3,
+            FindingMethod::Attribute => 4,
+            FindingMethod::Obfuscated => 5,
+            FindingMethod::Script => 6,
+            FindingMethod::Css => 7,
+        }
+    }
+    for (method, set) in page_results {
+        for addr in set {
+            let key = addr.to_ascii_lowercase();
+            let new_score = method_rank(method);
+            let category = EmailCategory::from_email(&addr);
+            let _ = base_host; // captured for symmetry; off-domain logic happens at rank time
+            out.entry(key)
+                .and_modify(|existing| {
+                    if method_rank(existing.method) > new_score {
+                        existing.method = method;
+                        existing.source_url = page_url.to_string();
+                    }
+                })
+                .or_insert(EmailFinding {
+                    email: addr,
+                    source_url: page_url.to_string(),
+                    method,
+                    category,
+                });
+        }
+    }
+}
+
+fn build_client() -> Result<reqwest::Client, BotError> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ",
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 HiredBot/0.1"
+        ))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()?)
+}
+
+/// Scrape a single company URL and return everything we found with provenance.
+///
+/// Crawl plan:
+/// 1. Fetch the home page, scan with every stage.
+/// 2. Follow contact-keyword links found in the nav/footer (one level deep,
+///    optionally a second level on contact-style URLs).
+/// 3. Pull contact-keyword `<loc>` entries out of `/sitemap.xml` and scan those.
+/// 4. Probe `WELL_KNOWN_CONTACT_PATHS` directly even if nothing linked to them.
+pub async fn scrape_with_provenance(input: &str) -> Result<ScrapeReport, BotError> {
     let trimmed = input.trim();
     if trimmed.is_empty() { return Err(BotError::InvalidUrl(input.into())); }
     let normalized = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -467,45 +777,38 @@ pub async fn scrape_emails_for_url(input: &str) -> Result<(Vec<String>, String),
     };
     let url = Url::parse(&normalized).map_err(|_| BotError::InvalidUrl(input.into()))?;
 
-    let client = reqwest::Client::builder()
-        .user_agent(concat!(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ",
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 HiredBot/0.1"
-        ))
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()?;
+    let client = build_client()?;
+    log::info!("scrape: starting {}", url.as_str());
 
-    let mut found = HashSet::new();
+    let mut findings: HashMap<String, EmailFinding> = HashMap::new();
     let mut visited: HashSet<String> = HashSet::new();
 
+    // 1) Home page.
     let resp = client.get(url.as_str()).send().await?;
     let final_url = resp.url().clone();
+    let base_host = final_url.host_str().unwrap_or("").to_string();
     visited.insert(final_url.as_str().to_string());
     let body = resp.text().await?;
-
     let company_name = extract_company_name(&body, final_url.as_str());
-    found.extend(scan_page(&body));
+    merge_findings(&mut findings, final_url.as_str(), &base_host, scan_page_provenanced(&body));
 
+    // 2) Contact-keyword links from the home page.
     let contact_links = extract_contact_links(&body, &final_url);
     let mut deep_budget: usize = 6;
-
     for link in contact_links {
         if !visited.insert(link.as_str().to_string()) { continue }
         let Ok(r) = client.get(link.as_str()).send().await else { continue };
         let Ok(text) = r.text().await else { continue };
-        found.extend(scan_page(&text));
+        merge_findings(&mut findings, link.as_str(), &base_host, scan_page_provenanced(&text));
 
-        // Stage 9: drill one level deeper on contact-style URLs.
         let link_low = link.as_str().to_ascii_lowercase();
         if DEEP_CRAWL_KEYWORDS.iter().any(|k| link_low.contains(k)) && deep_budget > 0 {
-            let sublinks = extract_contact_links(&text, &link);
-            for sub in sublinks {
+            for sub in extract_contact_links(&text, &link) {
                 if deep_budget == 0 { break }
                 if !visited.insert(sub.as_str().to_string()) { continue }
                 if let Ok(r2) = client.get(sub.as_str()).send().await {
                     if let Ok(t2) = r2.text().await {
-                        found.extend(scan_page(&t2));
+                        merge_findings(&mut findings, sub.as_str(), &base_host, scan_page_provenanced(&t2));
                     }
                 }
                 deep_budget -= 1;
@@ -513,20 +816,50 @@ pub async fn scrape_emails_for_url(input: &str) -> Result<(Vec<String>, String),
         }
     }
 
-    // Stage 10: probe well-known contact paths directly. Some sites bury contact info
-    // behind paths that aren't linked from the home page's nav/footer.
+    // 3) Sitemap-driven discovery.
+    for sm_url in discover_sitemap_pages(&client, &final_url).await {
+        if !visited.insert(sm_url.as_str().to_string()) { continue }
+        let Ok(r) = client.get(sm_url.as_str()).send().await else { continue };
+        if !r.status().is_success() { continue }
+        let Ok(text) = r.text().await else { continue };
+        merge_findings(&mut findings, sm_url.as_str(), &base_host, scan_page_provenanced(&text));
+    }
+
+    // 4) Well-known contact paths.
     for path in WELL_KNOWN_CONTACT_PATHS {
         let Ok(candidate) = final_url.join(path) else { continue };
         if !visited.insert(candidate.as_str().to_string()) { continue }
         let Ok(r) = client.get(candidate.as_str()).send().await else { continue };
         if !r.status().is_success() { continue }
         let Ok(text) = r.text().await else { continue };
-        found.extend(scan_page(&text));
+        merge_findings(&mut findings, candidate.as_str(), &base_host, scan_page_provenanced(&text));
     }
 
-    let mut emails: Vec<String> = found.into_iter().collect();
-    emails.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+    let mut findings: Vec<EmailFinding> = findings.into_values().collect();
+    findings.sort_by(|a, b| {
+        rank_with_context(&a.email, &base_host)
+            .cmp(&rank_with_context(&b.email, &base_host))
+            .then_with(|| a.email.cmp(&b.email))
+    });
 
-    if emails.is_empty() { return Err(BotError::NoEmails(input.to_string())); }
-    Ok((emails, company_name))
+    if findings.is_empty() {
+        log::info!("scrape: {} found 0 emails", final_url);
+        return Err(BotError::NoEmails(input.to_string()));
+    }
+    log::info!("scrape: {} found {} email(s)", final_url, findings.len());
+
+    Ok(ScrapeReport {
+        company_name,
+        final_url: final_url.to_string(),
+        findings,
+    })
+}
+
+/// Scrape a single company URL for contact emails. Returns (emails, company_name).
+///
+/// Compatibility shim around [`scrape_with_provenance`] for the bot's send pipeline,
+/// which only needs the email strings in priority order.
+pub async fn scrape_emails_for_url(input: &str) -> Result<(Vec<String>, String), BotError> {
+    let report = scrape_with_provenance(input).await?;
+    Ok((report.emails(), report.company_name))
 }
