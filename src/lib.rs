@@ -5,6 +5,8 @@
 
 pub mod config;
 pub mod error;
+pub mod gmail;
 pub mod history;
 pub mod mailer;
+pub mod queue;
 pub mod scraper;

@@ -37,6 +37,8 @@ fn screen_label(screen: Screen) -> &'static str {
         Screen::Sending => "sending",
         Screen::Done => "done",
         Screen::History => "history",
+        Screen::Enqueuing => "enqueuing",
+        Screen::Queue => "queue",
     }
 }
 
@@ -46,6 +48,7 @@ fn key_hints(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Ctrl+S", "Scrape"),
             ("Ctrl+L", "Load file"),
             ("Ctrl+H", "History"),
+            ("Ctrl+G", "Queue"),
             ("Ctrl+Q", "Quit"),
         ],
         Screen::Scraping => vec![
@@ -61,7 +64,8 @@ fn key_hints(screen: Screen) -> Vec<(&'static str, &'static str)> {
         ],
         Screen::Compose => vec![
             ("Tab", "Cycle"),
-            ("Ctrl+S", "Send"),
+            ("Ctrl+S", "Send now"),
+            ("Ctrl+E", "Enqueue (Gmail draft)"),
             ("Esc", "Back"),
         ],
         Screen::Sending => vec![
@@ -72,6 +76,14 @@ fn key_hints(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Esc", "Home"),
         ],
         Screen::History => vec![
+            ("↑↓", "Scroll"),
+            ("Esc", "Back"),
+        ],
+        Screen::Enqueuing => vec![
+            ("", "Creating Gmail drafts…"),
+        ],
+        Screen::Queue => vec![
+            ("R", "Reload"),
             ("↑↓", "Scroll"),
             ("Esc", "Back"),
         ],
@@ -100,6 +112,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Screen::Sending => render_sending(f, body, app),
         Screen::Done => render_done(f, body, app),
         Screen::History => render_history(f, body, app),
+        Screen::Enqueuing => render_enqueuing(f, body, app),
+        Screen::Queue => render_queue(f, body, app),
     }
 
     render_bottom(f, chunks[2], app);
@@ -513,4 +527,116 @@ fn render_history(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(Style::default().bg(Color::Rgb(30, 30, 30)));
 
     f.render_stateful_widget(list, area, &mut state);
+}
+
+// ---------- Enqueue progress ----------
+
+fn render_enqueuing(f: &mut Frame, area: Rect, app: &App) {
+    let (done, total) = app.enqueue_progress;
+    let pct = if total == 0 { 0u16 } else { (done * 100 / total).min(100) as u16 };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(s_dim())
+                .title(Span::styled(" creating drafts ", s_fg())),
+        )
+        .gauge_style(s_accent())
+        .label(format!("{done} / {total}"))
+        .percent(pct);
+    f.render_widget(gauge, chunks[0]);
+
+    let items: Vec<ListItem> = app.enqueue_results.iter().map(|r| {
+        let when = r.send_at.with_timezone(&chrono::Local).format("%a %H:%M").to_string();
+        let line = match &r.status {
+            Ok(id) => Line::from(vec![
+                Span::styled("✓ ", s_ok()),
+                Span::styled(r.email.clone(), s_fg()),
+                Span::styled(format!("  ({when})"), s_dim()),
+                Span::styled(format!("  draft={id}"), s_dim()),
+            ]),
+            Err(e) => Line::from(vec![
+                Span::styled("✗ ", s_err()),
+                Span::styled(r.email.clone(), s_err()),
+                Span::styled("  ", s_dim()),
+                Span::styled(e.clone(), s_err()),
+            ]),
+        };
+        ListItem::new(line)
+    }).collect();
+
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(s_dim())
+                .title(Span::styled(" log ", s_fg())),
+        ),
+        chunks[1],
+    );
+}
+
+// ---------- Queue inspector ----------
+
+fn render_queue(f: &mut Frame, area: Rect, app: &mut App) {
+    let total = app.queue_view.drafts.len();
+    let pending = app.queue_view.pending().count();
+    let sent = app.queue_view.drafts.iter()
+        .filter(|d| matches!(d.status, crate::queue::DraftStatus::Sent)).count();
+    let failed = app.queue_view.drafts.iter()
+        .filter(|d| matches!(d.status, crate::queue::DraftStatus::Failed)).count();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(area);
+
+    let header = Line::from(vec![
+        Span::styled("Pending: ", s_dim()),
+        Span::styled(format!("{pending}"), s_bold()),
+        Span::styled("   Sent: ", s_dim()),
+        Span::styled(format!("{sent}"), s_ok()),
+        Span::styled("   Failed: ", s_dim()),
+        Span::styled(format!("{failed}"), if failed == 0 { s_dim() } else { s_err() }),
+        Span::styled(format!("   Total: {total}"), s_dim()),
+    ]);
+    f.render_widget(Paragraph::new(header), chunks[0]);
+
+    let items: Vec<ListItem> = app.queue_view.drafts.iter().map(|d| {
+        let when = d.send_at.with_timezone(&chrono::Local).format("%a %d %b %H:%M").to_string();
+        let (mark, style) = match d.status {
+            crate::queue::DraftStatus::Pending => ("⏳", s_warn()),
+            crate::queue::DraftStatus::Sent    => ("✓",  s_ok()),
+            crate::queue::DraftStatus::Failed  => ("✗",  s_err()),
+        };
+        let label = if d.company.is_empty() { d.to.clone() } else { d.company.clone() };
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{mark} "), style),
+            Span::styled(format!("{label:<32}"), s_fg()),
+            Span::styled(format!("  {:<32}", d.to), s_dim()),
+            Span::styled(format!("  {when}"), s_accent()),
+        ]))
+    }).collect();
+
+    let mut state = ListState::default();
+    if total > 0 { state.select(Some(app.queue_idx.min(total - 1))); }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(s_dim())
+                .title(Span::styled(" send queue ", s_fg())),
+        )
+        .highlight_style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    f.render_stateful_widget(list, chunks[1], &mut state);
 }

@@ -1,11 +1,12 @@
 use crate::config::Config;
+use crate::gmail::{create_draft, ensure_token, DraftRequest};
 use crate::history::{SentEntry, SentHistory};
 use crate::mailer;
+use crate::queue::{DraftQueue, DraftStatus, ScheduledDraft};
 use crate::scraper;
 use crate::ui;
 use anyhow::Result;
-use chrono::Local;
-use chrono::Timelike;
+use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Timelike, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rand::Rng;
 use ratatui::backend::Backend;
@@ -24,6 +25,8 @@ pub enum Screen {
     Sending,
     Done,
     History,
+    Enqueuing,
+    Queue,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,16 @@ pub enum BgEvent {
     ScrapeDone,
     SendOne(SendResult),
     SendDone,
+    EnqueueOne(EnqueueResult),
+    EnqueueDone,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnqueueResult {
+    pub company: String,
+    pub email: String,
+    pub send_at: DateTime<Utc>,
+    pub status: Result<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +118,11 @@ pub struct App {
 
     pub send_results: Vec<SendResult>,
 
+    pub enqueue_results: Vec<EnqueueResult>,
+    pub enqueue_progress: (usize, usize),
+    pub queue_view: DraftQueue,
+    pub queue_idx: usize,
+
     pub history: SentHistory,
     pub contacted: HashSet<String>,
     pub history_idx: usize,
@@ -156,6 +174,10 @@ impl App {
             sites: Vec::new(),
             review_idx: 0,
             send_results: Vec::new(),
+            enqueue_results: Vec::new(),
+            enqueue_progress: (0, 0),
+            queue_view: DraftQueue::default(),
+            queue_idx: 0,
             history,
             contacted,
             history_idx: 0,
@@ -264,6 +286,22 @@ impl App {
                     self.status = "Press Enter or Esc to return home.".into();
                     break;
                 }
+                Ok(BgEvent::EnqueueOne(res)) => {
+                    self.enqueue_progress.0 += 1;
+                    self.enqueue_results.push(res);
+                }
+                Ok(BgEvent::EnqueueDone) => {
+                    self.bg_rx = None;
+                    self.queue_view = DraftQueue::load(&self.config.gmail.drafts_db);
+                    self.queue_idx = 0;
+                    self.screen = Screen::Queue;
+                    let ok = self.enqueue_results.iter().filter(|r| r.status.is_ok()).count();
+                    let total = self.enqueue_results.len();
+                    self.status = format!(
+                        "{ok}/{total} draft(s) queued. Run `cargo run --bin scheduler` to send."
+                    );
+                    break;
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.bg_rx = None;
@@ -309,7 +347,47 @@ impl App {
             Screen::Sending => self.handle_busy_key(key),
             Screen::Done => self.handle_done_key(key),
             Screen::History => self.handle_history_key(key),
+            Screen::Enqueuing => self.handle_busy_key(key),
+            Screen::Queue => self.handle_queue_key(key),
         }
+    }
+
+    fn handle_queue_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                self.screen = Screen::Urls;
+                self.status = "Paste URLs and press Ctrl+S to scrape.".into();
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.queue_view = DraftQueue::load(&self.config.gmail.drafts_db);
+                self.status = format!("Reloaded queue ({} drafts).", self.queue_view.drafts.len());
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.queue_idx > 0 { self.queue_idx -= 1; }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.queue_view.drafts.is_empty()
+                    && self.queue_idx + 1 < self.queue_view.drafts.len()
+                {
+                    self.queue_idx += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the read-only Queue inspector. Loads `drafts.json` fresh from disk.
+    pub fn open_queue(&mut self) {
+        self.queue_view = DraftQueue::load(&self.config.gmail.drafts_db);
+        self.queue_idx = 0;
+        self.screen = Screen::Queue;
+        let n = self.queue_view.drafts.len();
+        let pending = self.queue_view.pending().count();
+        self.status = if n == 0 {
+            "Queue empty. Schedule from Compose screen with Ctrl+E.".into()
+        } else {
+            format!("{n} draft(s) total · {pending} pending. [R]eload [Esc] back.")
+        };
     }
 
     fn handle_busy_key(&mut self, _key: KeyEvent) {}
@@ -317,6 +395,7 @@ impl App {
     fn handle_urls_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.start_scrape(),
+            (KeyCode::Char('g'), KeyModifiers::CONTROL) => self.open_queue(),
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 match std::fs::read_to_string("urls.txt") {
                     Ok(s) => {
@@ -429,6 +508,7 @@ impl App {
     fn handle_compose_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => { self.start_send(); return; }
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => { self.start_enqueue(); return; }
             (KeyCode::Esc, _) => {
                 self.screen = Screen::Review;
                 self.status = "Back to review.".into();
@@ -640,6 +720,172 @@ impl App {
             let _ = tx.send(BgEvent::SendDone);
         });
     }
+
+    /// Enqueue all picked sites as Gmail drafts and append them to `drafts.json`.
+    /// Each draft gets a `send_at` spaced `interval_min` apart starting at the
+    /// next window opening; the scheduler binary will hold each one until its
+    /// `send_at` arrives.
+    fn start_enqueue(&mut self) {
+        if self.config.gmail.client_id.is_empty() || self.config.gmail.client_secret.is_empty() {
+            self.status = "Gmail credentials missing — fill .env (GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET).".into();
+            return;
+        }
+        let subject = self.subject.lines().join(" ").trim().to_string();
+        let greeting_template = self.greeting.lines().join(" ").trim().to_string();
+        let body_template = self.body.lines().join("\n");
+        let cv_path = self.cv_path.lines().first().cloned().unwrap_or_default().trim().to_string();
+        let transcript_path = self.transcript_path.lines().first().cloned().unwrap_or_default().trim().to_string();
+
+        if subject.is_empty() {
+            self.status = "Subject is empty.".into();
+            return;
+        }
+        if !std::path::Path::new(&cv_path).is_file() {
+            self.status = format!("CV file not found: {cv_path}");
+            return;
+        }
+
+        let jobs: Vec<(String, String, String)> = self
+            .sites
+            .iter()
+            .filter(|s| !s.skip && !s.emails.is_empty())
+            .map(|s| (s.url.clone(), s.emails[s.selected].clone(), s.company_name.clone()))
+            .collect();
+        if jobs.is_empty() {
+            self.status = "No targets selected.".into();
+            return;
+        }
+
+        let send_times = compute_send_slots(
+            &self.config.schedule.window_start,
+            self.config.schedule.interval_min,
+            jobs.len(),
+        );
+
+        self.enqueue_results.clear();
+        self.enqueue_progress = (0, jobs.len());
+        self.screen = Screen::Enqueuing;
+        self.status = format!("Creating {} draft(s) in Gmail…", jobs.len());
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.bg_rx = Some(rx);
+
+        let gmail_cfg = self.config.gmail.clone();
+        let smtp_from_addr = self.config.smtp.from_address.clone();
+        let smtp_from_name = self.config.smtp.from_name.clone();
+        let drafts_db = self.config.gmail.drafts_db.clone();
+
+        tokio::spawn(async move {
+            // One token lookup up-front; reuse for every draft creation.
+            let token = match ensure_token(&gmail_cfg).await {
+                Ok(t) => t,
+                Err(e) => {
+                    for ((url, email, company), send_at) in jobs.iter().zip(send_times.iter()) {
+                        let _ = url;
+                        let _ = tx.send(BgEvent::EnqueueOne(EnqueueResult {
+                            company: company.clone(),
+                            email: email.clone(),
+                            send_at: *send_at,
+                            status: Err(format!("Gmail token: {e}")),
+                        }));
+                    }
+                    let _ = tx.send(BgEvent::EnqueueDone);
+                    return;
+                }
+            };
+
+            let mut queue = DraftQueue::load(&drafts_db);
+
+            for ((url, email, company), send_at) in jobs.into_iter().zip(send_times.into_iter()) {
+                let greeting_rendered = greeting_template.replace("{company}", &company);
+                let final_body = if greeting_rendered.trim().is_empty() {
+                    body_template.clone()
+                } else {
+                    format!("{greeting_rendered}\n\n{body_template}")
+                };
+
+                let req = DraftRequest {
+                    from_address: &smtp_from_addr,
+                    from_name: &smtp_from_name,
+                    to: &email,
+                    subject: &subject,
+                    body: &final_body,
+                    cv_path: &cv_path,
+                    transcript_path: &transcript_path,
+                };
+                let res = create_draft(&token.access_token, &req).await;
+                let _ = url;
+                match res {
+                    Ok(draft_id) => {
+                        queue.drafts.push(ScheduledDraft {
+                            draft_id: draft_id.clone(),
+                            company: company.clone(),
+                            to: email.clone(),
+                            send_at,
+                            status: DraftStatus::Pending,
+                            attempts: 0,
+                            note: String::new(),
+                        });
+                        let _ = tx.send(BgEvent::EnqueueOne(EnqueueResult {
+                            company,
+                            email,
+                            send_at,
+                            status: Ok(draft_id),
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BgEvent::EnqueueOne(EnqueueResult {
+                            company,
+                            email,
+                            send_at,
+                            status: Err(e.to_string()),
+                        }));
+                    }
+                }
+            }
+
+            let _ = queue.save(&drafts_db);
+            let _ = tx.send(BgEvent::EnqueueDone);
+        });
+    }
+}
+
+/// Compute `count` send slots, spaced `interval_min` apart, starting at the
+/// next occurrence of `window_start` (today if still in the future, otherwise
+/// tomorrow). Day-of-week skipping is left to the scheduler binary at send time.
+pub fn compute_send_slots(
+    window_start: &str,
+    interval_min: u32,
+    count: usize,
+) -> Vec<DateTime<Utc>> {
+    let now = Utc::now();
+    let now_local = now.with_timezone(&Local);
+    let parts: Vec<&str> = window_start.split(':').collect();
+    let (h, m) = match (parts.first().and_then(|s| s.parse().ok()),
+                        parts.get(1).and_then(|s| s.parse().ok())) {
+        (Some(h), Some(m)) => (h, m),
+        _ => (9u32, 30u32),
+    };
+    let start_today = now_local.date_naive().and_hms_opt(h, m, 0)
+        .unwrap_or_else(|| now_local.naive_local());
+    let mut anchor_local = if start_today > now_local.naive_local() {
+        start_today
+    } else {
+        start_today + ChronoDuration::days(1)
+    };
+    // anchor_local is naive; treat it as local time and convert back to UTC.
+    let mut out = Vec::with_capacity(count);
+    let interval = ChronoDuration::minutes(interval_min as i64);
+    for _ in 0..count {
+        let anchor_utc = Local
+            .from_local_datetime(&anchor_local)
+            .single()
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or(now);
+        out.push(anchor_utc);
+        anchor_local += interval;
+    }
+    out
 }
 
 fn current_hour_in_tz(timezone: &str) -> u32 {

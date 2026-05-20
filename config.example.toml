@@ -32,6 +32,28 @@ send_window_end = 22
 # Examples: "Europe/Istanbul", "America/New_York", "UTC"
 timezone = "Local"
 
+# ---------- Gmail-draft scheduler (used by `scheduler` binary + TUI [Ctrl+E]) ----------
+#
+# Drafts are created in Gmail with [Ctrl+E] inside the TUI, then sent by the
+# scheduler binary at the times below. Bot can be closed; scheduler keeps
+# running under systemd / launchd / Windows Task Scheduler.
+
+[schedule]
+window_start = "09:30"     # daily send window opens (HH:MM, local tz)
+window_end   = "17:00"     # daily send window closes
+days         = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+interval_min = 45          # minutes between two consecutive sends
+daily_limit  = 15          # hard cap per calendar day
+timezone     = "Local"     # IANA name or "Local"
+
+[gmail]
+# client_id / client_secret are read from .env (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET)
+# — never put them here.
+token_cache = "token_cache.json"
+drafts_db   = "drafts.json"
+sent_log    = "sent_log.json"
+failed_log  = "failed_log.json"
+
 [smtp]
 # Gmail example. Use an App Password, not your normal account password.
 # https://support.google.com/accounts/answer/185833

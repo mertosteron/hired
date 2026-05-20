@@ -1,8 +1,10 @@
 mod app;
 mod config;
 mod error;
+mod gmail;
 mod history;
 mod mailer;
+mod queue;
 mod scraper;
 mod ui;
 
@@ -30,7 +32,8 @@ fn install_panic_hook() {
 async fn main() -> Result<()> {
     install_panic_hook();
 
-    let (config, warning) = config::Config::load_or_default("config.toml");
+    let (mut config, warning) = config::Config::load_or_default("config.toml");
+    config.apply_env_overrides();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

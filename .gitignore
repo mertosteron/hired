@@ -1,3 +1,15 @@
 config.toml
 target/
 .claude/
+
+# Secrets — Gmail OAuth credentials and refresh tokens
+.env
+credentials.json
+token_cache.json
+
+# Queue + outcome logs — local state only
+drafts.json
+sent_log.json
+failed_log.json
+sent_history.json
+send_log_*.csv
