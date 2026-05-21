@@ -59,6 +59,8 @@ client.
    a project (any name).
 2. **APIs & Services → Library** → search for **Gmail API** → **Enable**.
 3. **APIs & Services → OAuth consent screen**
+   * **Get started**
+   * App name: **Hired**, User support email: **your own Gmail address**
    * User type: **External**
    * Add **your own Gmail address** as a *test user*
    * Scopes: add `https://www.googleapis.com/auth/gmail.compose`
