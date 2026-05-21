@@ -1,0 +1,69 @@
+# Domains whose emails are never returned even if the regex matches them.
+# Edit freely — entries are loaded once at scraper startup.
+#
+# Matching is suffix-based: an entry "foo.com" blocks both `foo.com`
+# and `bar.foo.com`. Subdomains of an anchor that overlaps a blocked
+# entry will still be blocked.
+
+domains = [
+    # Ads & analytics
+    "doubleclick.net",
+    "googleadservices.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "facebook.com",
+    "facebook.net",
+    "hotjar.com",
+    "mixpanel.com",
+    "segment.com",
+    "segment.io",
+    "hubspot.com",
+    "marketo.com",
+    "amplitude.com",
+
+    # Transactional mail providers
+    "mailchimp.com",
+    "mailerlite.com",
+    "sendgrid.net",
+    "sendgrid.com",
+    "amazonses.com",
+    "sparkpostmail.com",
+    "mandrillapp.com",
+    "postmarkapp.com",
+    "mailgun.org",
+    "mailgun.net",
+
+    # Support / chat widgets
+    "zendesk.com",
+    "intercom.io",
+    "intercom.com",
+    "freshdesk.com",
+    "drift.com",
+    "tidio.io",
+    "tawk.to",
+    "crisp.chat",
+
+    # Social media
+    "twitter.com",
+    "x.com",
+    "linkedin.com",
+    "instagram.com",
+    "youtube.com",
+    "tiktok.com",
+    "pinterest.com",
+
+    # CDN & infrastructure
+    "cloudflare.com",
+    "fastly.net",
+    "akamaihd.net",
+    "akamai.com",
+    "cloudfront.net",
+
+    # Misc placeholder domains
+    "example.com",
+    "example.org",
+    "test.com",
+    "yourdomain.com",
+    "yourcompany.com",
+    "domain.com",
+]

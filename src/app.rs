@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, ScheduleConfig};
 use crate::gmail::{create_draft, ensure_token, DraftRequest};
 use crate::history::{SentEntry, SentHistory};
 use crate::mailer;
@@ -6,7 +6,8 @@ use crate::queue::{DraftQueue, DraftStatus, ScheduledDraft};
 use crate::scraper;
 use crate::ui;
 use anyhow::Result;
-use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime,
+             NaiveTime, TimeZone, Timelike, Utc, Weekday};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use rand::Rng;
 use ratatui::backend::Backend;
@@ -27,6 +28,7 @@ pub enum Screen {
     History,
     Enqueuing,
     Queue,
+    Summary,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +124,9 @@ pub struct App {
     pub enqueue_progress: (usize, usize),
     pub queue_view: DraftQueue,
     pub queue_idx: usize,
+    /// Cached "is the scheduler binary process running right now?" result,
+    /// computed once when the Summary screen opens.
+    pub scheduler_running: bool,
 
     pub history: SentHistory,
     pub contacted: HashSet<String>,
@@ -178,6 +183,7 @@ impl App {
             enqueue_progress: (0, 0),
             queue_view: DraftQueue::default(),
             queue_idx: 0,
+            scheduler_running: false,
             history,
             contacted,
             history_idx: 0,
@@ -294,12 +300,15 @@ impl App {
                     self.bg_rx = None;
                     self.queue_view = DraftQueue::load(&self.config.gmail.drafts_db);
                     self.queue_idx = 0;
-                    self.screen = Screen::Queue;
+                    self.scheduler_running = scheduler_process_running();
+                    self.screen = Screen::Summary;
                     let ok = self.enqueue_results.iter().filter(|r| r.status.is_ok()).count();
                     let total = self.enqueue_results.len();
-                    self.status = format!(
-                        "{ok}/{total} draft(s) queued. Run `cargo run --bin scheduler` to send."
-                    );
+                    self.status = if ok == total {
+                        format!("{ok} mail(s) scheduled.")
+                    } else {
+                        format!("{ok}/{total} scheduled — see list for failures.")
+                    };
                     break;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -349,6 +358,14 @@ impl App {
             Screen::History => self.handle_history_key(key),
             Screen::Enqueuing => self.handle_busy_key(key),
             Screen::Queue => self.handle_queue_key(key),
+            Screen::Summary => self.handle_summary_key(key),
+        }
+    }
+
+    fn handle_summary_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => self.reset_to_home(),
+            _ => {}
         }
     }
 
@@ -498,17 +515,27 @@ impl App {
     fn proceed_to_compose(&mut self) {
         let any_picked = self.sites.iter().any(|s| !s.skip && !s.emails.is_empty());
         if !any_picked {
-            self.status = "Nothing to send — all sites skipped or have no emails.".into();
+            self.status = "Queue is empty — nothing to schedule.".into();
             return;
         }
         self.screen = Screen::Compose;
-        self.status = "Edit message, then Ctrl+S to send.".into();
+        self.status = "Edit message, then Ctrl+S to schedule.".into();
     }
 
     fn handle_compose_key(&mut self, key: KeyEvent) {
+        let is_single_line = matches!(
+            self.compose_focus,
+            ComposeField::Subject
+                | ComposeField::Greeting
+                | ComposeField::CvPath
+                | ComposeField::TranscriptPath
+        );
         match (key.code, key.modifiers) {
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => { self.start_send(); return; }
-            (KeyCode::Char('e'), KeyModifiers::CONTROL) => { self.start_enqueue(); return; }
+            // Ctrl+S schedules from anywhere (including inside the multi-line
+            // body). Enter is the secondary trigger when focus is not on a
+            // multi-line field, mirroring the spec's "press Enter to confirm".
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => { self.start_enqueue(); return; }
+            (KeyCode::Enter, _) if is_single_line => { self.start_enqueue(); return; }
             (KeyCode::Esc, _) => {
                 self.screen = Screen::Review;
                 self.status = "Back to review.".into();
@@ -518,13 +545,6 @@ impl App {
             (KeyCode::BackTab, _) => { self.compose_focus = self.compose_focus.prev(); return; }
             _ => {}
         }
-        let is_single_line = matches!(
-            self.compose_focus,
-            ComposeField::Subject
-                | ComposeField::Greeting
-                | ComposeField::CvPath
-                | ComposeField::TranscriptPath
-        );
         if is_single_line && key.code == KeyCode::Enter { return; }
         let target: &mut TextArea<'static> = match self.compose_focus {
             ComposeField::Subject => &mut self.subject,
@@ -601,6 +621,9 @@ impl App {
         });
     }
 
+    /// Retained for reference — the bot no longer triggers immediate SMTP
+    /// sends. Ctrl+S now always routes through `start_enqueue`.
+    #[allow(dead_code)]
     fn start_send(&mut self) {
         let subject = self.subject.lines().join(" ").trim().to_string();
         let greeting_template = self.greeting.lines().join(" ").trim().to_string();
@@ -756,11 +779,7 @@ impl App {
             return;
         }
 
-        let send_times = compute_send_slots(
-            &self.config.schedule.window_start,
-            self.config.schedule.interval_min,
-            jobs.len(),
-        );
+        let send_times = compute_send_slots(&self.config.schedule, jobs.len());
 
         self.enqueue_results.clear();
         self.enqueue_progress = (0, jobs.len());
@@ -850,42 +869,154 @@ impl App {
     }
 }
 
-/// Compute `count` send slots, spaced `interval_min` apart, starting at the
-/// next occurrence of `window_start` (today if still in the future, otherwise
-/// tomorrow). Day-of-week skipping is left to the scheduler binary at send time.
-pub fn compute_send_slots(
-    window_start: &str,
-    interval_min: u32,
-    count: usize,
-) -> Vec<DateTime<Utc>> {
+/// Compute `count` send slots distributed across daily windows defined by
+/// `cfg`. Each slot honors:
+///
+/// - `window_start` / `window_end`: a slot is only emitted while `cursor` is
+///   strictly inside the open window.
+/// - `days`: weekdays not listed in `cfg.days` are skipped entirely.
+/// - `daily_limit`: at most this many slots may land on the same calendar day.
+/// - `interval_min`: minimum gap between two consecutive slots.
+///
+/// The cursor starts at the next future occurrence of `window_start`: today
+/// if today is a valid weekday and `window_start` is still in the future,
+/// otherwise the next valid day's `window_start`.
+pub fn compute_send_slots(cfg: &ScheduleConfig, count: usize) -> Vec<DateTime<Utc>> {
+    if count == 0 {
+        return Vec::new();
+    }
     let now = Utc::now();
-    let now_local = now.with_timezone(&Local);
-    let parts: Vec<&str> = window_start.split(':').collect();
-    let (h, m) = match (parts.first().and_then(|s| s.parse().ok()),
-                        parts.get(1).and_then(|s| s.parse().ok())) {
-        (Some(h), Some(m)) => (h, m),
-        _ => (9u32, 30u32),
-    };
-    let start_today = now_local.date_naive().and_hms_opt(h, m, 0)
-        .unwrap_or_else(|| now_local.naive_local());
-    let mut anchor_local = if start_today > now_local.naive_local() {
-        start_today
+    let now_local = now.with_timezone(&Local).naive_local();
+
+    let win_start = parse_hhmm_or(&cfg.window_start, NaiveTime::from_hms_opt(9, 30, 0).unwrap());
+    let win_end = parse_hhmm_or(&cfg.window_end, NaiveTime::from_hms_opt(17, 0, 0).unwrap());
+    let interval = ChronoDuration::minutes(cfg.interval_min.max(1) as i64);
+    let daily_limit = cfg.daily_limit.max(1) as usize;
+
+    let today = now_local.date();
+    let today_start = today.and_time(win_start);
+    let mut cursor: NaiveDateTime = if is_valid_weekday(today, &cfg.days) && now_local < today_start
+    {
+        today_start
     } else {
-        start_today + ChronoDuration::days(1)
+        next_valid_day_start(today, win_start, &cfg.days)
     };
-    // anchor_local is naive; treat it as local time and convert back to UTC.
+    let mut sent_today: usize = 0;
     let mut out = Vec::with_capacity(count);
-    let interval = ChronoDuration::minutes(interval_min as i64);
-    for _ in 0..count {
-        let anchor_utc = Local
-            .from_local_datetime(&anchor_local)
-            .single()
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or(now);
-        out.push(anchor_utc);
-        anchor_local += interval;
+    // Hard ceiling on advance attempts: a pathological `days: []` config
+    // would otherwise loop forever. ~365 days × 2 transitions per day is more
+    // than enough for any realistic schedule.
+    let mut advance_budget: u32 = 800;
+
+    while out.len() < count {
+        let cur_end = cursor.date().and_time(win_end);
+        let needs_advance = cursor >= cur_end
+            || sent_today >= daily_limit
+            || !is_valid_weekday(cursor.date(), &cfg.days);
+        if needs_advance {
+            if advance_budget == 0 {
+                break;
+            }
+            advance_budget -= 1;
+            cursor = next_valid_day_start(cursor.date(), win_start, &cfg.days);
+            sent_today = 0;
+            continue;
+        }
+        out.push(naive_local_to_utc(cursor, now));
+        cursor += interval;
+        sent_today += 1;
     }
     out
+}
+
+fn parse_hhmm_or(s: &str, fallback: NaiveTime) -> NaiveTime {
+    NaiveTime::parse_from_str(s.trim(), "%H:%M").unwrap_or(fallback)
+}
+
+fn naive_local_to_utc(local: NaiveDateTime, fallback: DateTime<Utc>) -> DateTime<Utc> {
+    Local
+        .from_local_datetime(&local)
+        .single()
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(fallback)
+}
+
+fn is_valid_weekday(date: NaiveDate, allowed: &[String]) -> bool {
+    allowed.iter().any(|d| weekday_label_matches(date.weekday(), d))
+}
+
+fn next_valid_day_start(after: NaiveDate, win_start: NaiveTime, allowed: &[String]) -> NaiveDateTime {
+    let mut d = after + ChronoDuration::days(1);
+    for _ in 0..14 {
+        if is_valid_weekday(d, allowed) {
+            return d.and_time(win_start);
+        }
+        d += ChronoDuration::days(1);
+    }
+    // Pathological config (no allowed days) — return the day after `after`
+    // anyway so the caller still terminates.
+    (after + ChronoDuration::days(1)).and_time(win_start)
+}
+
+/// Same label set as `bin/scheduler.rs`. Duplicated rather than reaching into
+/// the binary so the bot doesn't link the scheduler's main.
+fn weekday_label_matches(wd: Weekday, label: &str) -> bool {
+    let want = match label.to_ascii_lowercase().as_str() {
+        "mon" | "monday" | "pzt" | "pazartesi" => Weekday::Mon,
+        "tue" | "tuesday" | "sal" | "salı" | "sali" => Weekday::Tue,
+        "wed" | "wednesday" | "çar" | "car" | "çarşamba" | "carsamba" => Weekday::Wed,
+        "thu" | "thursday" | "per" | "perşembe" | "persembe" => Weekday::Thu,
+        "fri" | "friday" | "cum" | "cuma" => Weekday::Fri,
+        "sat" | "saturday" | "cmt" | "cumartesi" => Weekday::Sat,
+        "sun" | "sunday" | "paz" | "pazar" => Weekday::Sun,
+        _ => return false,
+    };
+    wd == want
+}
+
+/// Is a process whose cmdline contains "scheduler" currently running?
+///
+/// Best-effort and platform-aware: reads `/proc/*/cmdline` on Linux,
+/// shells out to `pgrep -f scheduler` on macOS, returns `false` elsewhere.
+/// A `false` answer means "couldn't confirm" as much as "definitely not
+/// running" — the Summary screen shows a hint either way.
+pub fn scheduler_process_running() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else { return false };
+        let my_pid = std::process::id();
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if !name.chars().all(|c| c.is_ascii_digit()) { continue }
+            let pid: u32 = match name.parse() { Ok(p) => p, Err(_) => continue };
+            if pid == my_pid { continue }
+            let cmdline_path = entry.path().join("cmdline");
+            let Ok(content) = std::fs::read(&cmdline_path) else { continue };
+            let s = String::from_utf8_lossy(&content);
+            // /proc/PID/cmdline is NUL-separated; we just need any segment to
+            // mention "scheduler". Skip cargo/rustc invocations.
+            if s.contains("cargo") || s.contains("rustc") { continue }
+            for seg in s.split('\0') {
+                let trimmed = seg.trim_end_matches('/');
+                let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+                if last == "scheduler" || last.ends_with("/scheduler") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(out) = std::process::Command::new("pgrep").arg("-f").arg("/scheduler").output()
+        else { return false };
+        out.status.success() && !out.stdout.is_empty()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { false }
 }
 
 fn current_hour_in_tz(timezone: &str) -> u32 {
@@ -895,5 +1026,74 @@ fn current_hour_in_tz(timezone: &str) -> u32 {
     match timezone.parse::<chrono_tz::Tz>() {
         Ok(tz) => Local::now().with_timezone(&tz).hour(),
         Err(_) => Local::now().hour(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workday_cfg() -> ScheduleConfig {
+        ScheduleConfig {
+            window_start: "09:30".into(),
+            window_end: "17:00".into(),
+            days: ["Mon", "Tue", "Wed", "Thu", "Fri"].iter().map(|s| s.to_string()).collect(),
+            interval_min: 45,
+            daily_limit: 15,
+            timezone: "Local".into(),
+        }
+    }
+
+    #[test]
+    fn slots_respect_daily_limit_and_window_end() {
+        let cfg = workday_cfg();
+        let slots = compute_send_slots(&cfg, 30);
+        assert_eq!(slots.len(), 30);
+
+        let interval = ChronoDuration::minutes(cfg.interval_min as i64);
+        let win_end = NaiveTime::parse_from_str(&cfg.window_end, "%H:%M").unwrap();
+        let win_start = NaiveTime::parse_from_str(&cfg.window_start, "%H:%M").unwrap();
+
+        // Group by local date; each group must stay inside the window and obey
+        // daily_limit + interval.
+        let mut by_date: std::collections::BTreeMap<chrono::NaiveDate, Vec<NaiveDateTime>> =
+            std::collections::BTreeMap::new();
+        for s in &slots {
+            let local = s.with_timezone(&Local).naive_local();
+            by_date.entry(local.date()).or_default().push(local);
+        }
+        for (date, day_slots) in &by_date {
+            assert!(day_slots.len() <= cfg.daily_limit as usize, "{date}: {} slots", day_slots.len());
+            assert!(
+                weekday_label_matches(date.weekday(), "Mon")
+                    || weekday_label_matches(date.weekday(), "Tue")
+                    || weekday_label_matches(date.weekday(), "Wed")
+                    || weekday_label_matches(date.weekday(), "Thu")
+                    || weekday_label_matches(date.weekday(), "Fri"),
+                "non-workday landed: {date:?}"
+            );
+            for w in day_slots.windows(2) {
+                assert!(w[1] - w[0] >= interval, "interval violated on {date}");
+            }
+            for s in day_slots {
+                assert!(s.time() >= win_start, "before window_start: {s:?}");
+                assert!(s.time() < win_end, "past window_end: {s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_days_terminates() {
+        let mut cfg = workday_cfg();
+        cfg.days = vec![];
+        let slots = compute_send_slots(&cfg, 5);
+        // No valid days means the algorithm should bail rather than hang.
+        assert!(slots.len() < 5);
+    }
+
+    #[test]
+    fn zero_count_returns_empty() {
+        let cfg = workday_cfg();
+        assert!(compute_send_slots(&cfg, 0).is_empty());
     }
 }

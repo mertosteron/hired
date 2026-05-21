@@ -2,6 +2,7 @@ use crate::error::BotError;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use scraper::{Html, Selector};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use url::Url;
@@ -63,7 +64,81 @@ const TRANSACTIONAL_LOCALS: &[&str] = &[
     "noreply", "no-reply", "donotreply", "do-not-reply",
     "bounce", "bounces", "mailer-daemon", "mailerdaemon", "postmaster",
     "unsubscribe", "support", "help",
+    "notifications", "alerts", "alert", "notification",
 ];
+
+/// Two-part public suffixes that need three-label eTLD+1 extraction.
+/// Not exhaustive — covers the cases the bot actually meets.
+const MULTI_PART_TLDS: &[&str] = &[
+    "com.tr", "com.au", "com.br", "com.mx", "com.ar", "com.cn", "com.sg",
+    "com.hk", "com.tw", "com.sa", "com.de", "com.ua", "com.np",
+    "co.uk", "co.jp", "co.kr", "co.nz", "co.za", "co.in", "co.il", "co.id",
+    "org.uk", "org.au", "ac.uk", "gov.uk", "net.au",
+];
+
+/// Domains whose emails are dropped even when the regex matches them.
+/// Loaded from `blocked_domains.toml` next to the binary; failure is silent
+/// (treated as an empty list).
+#[derive(Deserialize, Default)]
+struct BlockedDomainsFile {
+    #[serde(default)]
+    domains: Vec<String>,
+}
+
+static BLOCKED_DOMAINS: Lazy<Vec<String>> = Lazy::new(|| {
+    let raw = std::fs::read_to_string("blocked_domains.toml").unwrap_or_default();
+    let parsed: BlockedDomainsFile = toml::from_str(&raw).unwrap_or_default();
+    parsed
+        .domains
+        .into_iter()
+        .map(|d| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect()
+});
+
+/// Lowercase the host, drop `www.`, return the eTLD+1 (or eTLD+2 for
+/// `com.tr`-style suffixes). Returns the original host as fallback if it
+/// has fewer labels than expected.
+pub fn anchor_etld_plus_one(host: &str) -> String {
+    let h = host.trim_start_matches("www.").to_ascii_lowercase();
+    let parts: Vec<&str> = h.split('.').collect();
+    if parts.len() < 2 {
+        return h;
+    }
+    for tld in MULTI_PART_TLDS {
+        let dotted = format!(".{tld}");
+        if h.ends_with(&dotted) && parts.len() >= 3 {
+            return parts[parts.len() - 3..].join(".");
+        }
+    }
+    parts[parts.len() - 2..].join(".")
+}
+
+/// True when `host` is the anchor itself or any subdomain of it.
+fn is_on_anchor(host: &str, anchor: &str) -> bool {
+    let h = host.trim_start_matches("www.").to_ascii_lowercase();
+    let a = anchor.trim_start_matches("www.").to_ascii_lowercase();
+    if a.is_empty() {
+        return false;
+    }
+    h == a || h.ends_with(&format!(".{a}"))
+}
+
+/// Suffix-match against `BLOCKED_DOMAINS`. Same rule as `is_on_anchor`.
+fn is_blocked_host(host: &str) -> bool {
+    let h = host.trim_start_matches("www.").to_ascii_lowercase();
+    BLOCKED_DOMAINS
+        .iter()
+        .any(|b| h == *b || h.ends_with(&format!(".{b}")))
+}
+
+fn email_host(addr: &str) -> String {
+    addr.to_ascii_lowercase()
+        .split('@')
+        .nth(1)
+        .unwrap_or("")
+        .to_string()
+}
 
 const SOCIAL_DOMAINS: &[&str] = &[
     "twitter.com", "x.com", "facebook.com", "linkedin.com",
@@ -135,6 +210,113 @@ fn extract_emails_from_scripts(html: &str) -> HashSet<String> {
         }
     }
     out
+}
+
+/// Recovers emails split across sibling elements, e.g.
+/// `<span>info</span><span>@</span><span>adapha</span><span>.com</span>`.
+/// `Html::text()` concatenates DOM text nodes with no separators, so the
+/// regex sees `info@adapha.com` and matches.
+///
+/// Also catches RTL-reversed content: when an element carries `direction:rtl`
+/// or `unicode-bidi`, we run the regex on both the original and the reversed
+/// text.
+fn extract_emails_from_rendered_text(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let html_low = html.to_ascii_lowercase();
+    let doc = Html::parse_document(html);
+
+    // `Html::text()` concatenates DOM text nodes with no separator. That is
+    // what reunites `<span>info</span><span>@</span>...` into "info@adapha.com",
+    // but it can also fuse adjacent unrelated fragments into bogus addresses
+    // (e.g. `Samsuninfo@adapha.com`). Guard: only accept candidates whose
+    // local part appears verbatim somewhere in the raw HTML.
+    if let Ok(sel) = Selector::parse("body") {
+        if let Some(body) = doc.select(&sel).next() {
+            let text: String = body.text().collect();
+            let mut candidates: HashSet<String> = HashSet::new();
+            push_emails(&mut candidates, &text);
+            let deob = deobfuscate(&text);
+            if deob != text {
+                push_emails(&mut candidates, &deob);
+            }
+            for c in candidates {
+                let lc = c.to_ascii_lowercase();
+                let local = lc.split('@').next().unwrap_or("");
+                if local.len() >= 2 && html_low.contains(local) {
+                    out.insert(c);
+                }
+            }
+        }
+    }
+
+    if let Ok(sel) = Selector::parse("[style]") {
+        for el in doc.select(&sel) {
+            let Some(style) = el.value().attr("style") else { continue };
+            let s = style.to_ascii_lowercase();
+            if !(s.contains("rtl") || s.contains("unicode-bidi")) {
+                continue;
+            }
+            let text: String = el.text().collect();
+            let reversed: String = text.chars().rev().collect();
+            for cand in EMAIL_RE.find_iter(&reversed) {
+                let s = cand.as_str();
+                if is_junk(s) {
+                    continue;
+                }
+                let host = email_host(s);
+                if !host.is_empty() && html_low.contains(&host) {
+                    out.insert(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse every `<script type="application/ld+json">` block as JSON and pull
+/// every `email` / `contactPoint.email` value out of the tree.
+fn extract_emails_from_jsonld(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let doc = Html::parse_document(html);
+    let Ok(sel) = Selector::parse(r#"script[type="application/ld+json"]"#) else {
+        return out;
+    };
+    for s in doc.select(&sel) {
+        let text = s.text().collect::<String>();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            walk_jsonld_email(&json, &mut out);
+        }
+    }
+    out
+}
+
+fn walk_jsonld_email(v: &serde_json::Value, out: &mut HashSet<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                if k.eq_ignore_ascii_case("email") {
+                    if let Some(s) = val.as_str() {
+                        let addr = s.trim().trim_start_matches("mailto:").trim();
+                        if EMAIL_RE.is_match(addr) && !is_junk(addr) {
+                            out.insert(addr.to_string());
+                        }
+                        continue;
+                    }
+                }
+                walk_jsonld_email(val, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                walk_jsonld_email(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---------- Stage 6: deobfuscation ----------
@@ -392,6 +574,8 @@ pub enum FindingMethod {
     DataAttr,
     Css,
     Cloudflare,
+    JsonLd,
+    RenderedText,
 }
 
 impl FindingMethod {
@@ -405,6 +589,8 @@ impl FindingMethod {
             FindingMethod::DataAttr => "data-*",
             FindingMethod::Css => "css content",
             FindingMethod::Cloudflare => "cloudflare cfemail",
+            FindingMethod::JsonLd => "json-ld",
+            FindingMethod::RenderedText => "rendered text",
         }
     }
 }
@@ -499,27 +685,40 @@ fn scan_page_provenanced(html: &str) -> HashMap<FindingMethod, HashSet<String>> 
     let cf = extract_emails_from_cloudflare(html);
     if !cf.is_empty() { out.insert(FindingMethod::Cloudflare, cf); }
 
+    let jsonld = extract_emails_from_jsonld(html);
+    if !jsonld.is_empty() { out.insert(FindingMethod::JsonLd, jsonld); }
+
+    let rendered = extract_emails_from_rendered_text(html);
+    if !rendered.is_empty() { out.insert(FindingMethod::RenderedText, rendered); }
+
     out
 }
 
 
 // ---------- Contact-page link extraction ----------
 
-fn extract_contact_links(html: &str, base: &Url) -> Vec<Url> {
+fn extract_contact_links(html: &str, base: &Url, anchor: &str) -> Vec<Url> {
     let doc = Html::parse_document(html);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let Ok(sel) = Selector::parse("a[href]") else { return out };
     for a in doc.select(&sel) {
         let Some(href) = a.value().attr("href") else { continue };
-        if href.starts_with("mailto:") || href.starts_with("tel:") || href.starts_with('#') { continue }
+        if href.starts_with("javascript:")
+            || href.starts_with("mailto:")
+            || href.starts_with("tel:")
+            || href.starts_with('#')
+        {
+            continue;
+        }
         let text = a.text().collect::<String>().to_lowercase();
         let href_low = href.to_lowercase();
         let is_contact = CONTACT_KEYWORDS.iter().any(|k| href_low.contains(k) || text.contains(k));
         if !is_contact { continue }
         if let Ok(url) = base.join(href) {
             if !url.scheme().starts_with("http") { continue }
-            if url.host_str() != base.host_str() { continue }
+            let Some(host) = url.host_str() else { continue };
+            if !is_on_anchor(host, anchor) { continue }
             let key = url.as_str().to_string();
             if seen.insert(key) { out.push(url); }
         }
@@ -656,11 +855,13 @@ fn is_off_domain(addr: &str, base_host: &str) -> bool {
 
 // ---------- Sitemap discovery ----------
 
-/// Fetch `/sitemap.xml` and return contact-flavored same-host URLs. Capped
-/// so a 5,000-entry sitemap can't blow up the crawl budget.
+/// Fetch `/sitemap.xml` and return contact-flavored URLs that sit on the
+/// anchor domain (or any subdomain of it). Capped so a 5,000-entry sitemap
+/// can't blow up the crawl budget.
 async fn discover_sitemap_pages(
     client: &reqwest::Client,
     base: &Url,
+    anchor: &str,
 ) -> Vec<Url> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -669,12 +870,12 @@ async fn discover_sitemap_pages(
     if !resp.status().is_success() { return out }
     let Ok(body) = resp.text().await else { return out };
 
-    let base_host = base.host_str().unwrap_or("");
     for cap in SITEMAP_LOC_RE.captures_iter(&body) {
         let Some(loc) = cap.get(1) else { continue };
         let loc = loc.as_str().trim();
         let Ok(u) = Url::parse(loc) else { continue };
-        if u.host_str() != Some(base_host) { continue }
+        let Some(host) = u.host_str() else { continue };
+        if !is_on_anchor(host, anchor) { continue }
         let path_low = u.path().to_ascii_lowercase();
         let interesting = CONTACT_KEYWORDS.iter().any(|k| path_low.contains(k));
         if !interesting { continue }
@@ -717,12 +918,14 @@ fn merge_findings(
         match m {
             FindingMethod::Mailto => 0,
             FindingMethod::Cloudflare => 1,
-            FindingMethod::PlainText => 2,
-            FindingMethod::DataAttr => 3,
-            FindingMethod::Attribute => 4,
-            FindingMethod::Obfuscated => 5,
-            FindingMethod::Script => 6,
-            FindingMethod::Css => 7,
+            FindingMethod::JsonLd => 2,
+            FindingMethod::PlainText => 3,
+            FindingMethod::RenderedText => 4,
+            FindingMethod::DataAttr => 5,
+            FindingMethod::Attribute => 6,
+            FindingMethod::Obfuscated => 7,
+            FindingMethod::Script => 8,
+            FindingMethod::Css => 9,
         }
     }
     for (method, set) in page_results {
@@ -792,8 +995,11 @@ pub async fn scrape_with_provenance(input: &str) -> Result<ScrapeReport, BotErro
     let company_name = extract_company_name(&body, final_url.as_str());
     merge_findings(&mut findings, final_url.as_str(), &base_host, scan_page_provenanced(&body));
 
+    let anchor = anchor_etld_plus_one(&base_host);
+    log::info!("scrape: anchor domain = {anchor}");
+
     // 2) Contact-keyword links from the home page.
-    let contact_links = extract_contact_links(&body, &final_url);
+    let contact_links = extract_contact_links(&body, &final_url, &anchor);
     let mut deep_budget: usize = 6;
     for link in contact_links {
         if !visited.insert(link.as_str().to_string()) { continue }
@@ -803,7 +1009,7 @@ pub async fn scrape_with_provenance(input: &str) -> Result<ScrapeReport, BotErro
 
         let link_low = link.as_str().to_ascii_lowercase();
         if DEEP_CRAWL_KEYWORDS.iter().any(|k| link_low.contains(k)) && deep_budget > 0 {
-            for sub in extract_contact_links(&text, &link) {
+            for sub in extract_contact_links(&text, &link, &anchor) {
                 if deep_budget == 0 { break }
                 if !visited.insert(sub.as_str().to_string()) { continue }
                 if let Ok(r2) = client.get(sub.as_str()).send().await {
@@ -817,7 +1023,7 @@ pub async fn scrape_with_provenance(input: &str) -> Result<ScrapeReport, BotErro
     }
 
     // 3) Sitemap-driven discovery.
-    for sm_url in discover_sitemap_pages(&client, &final_url).await {
+    for sm_url in discover_sitemap_pages(&client, &final_url, &anchor).await {
         if !visited.insert(sm_url.as_str().to_string()) { continue }
         let Ok(r) = client.get(sm_url.as_str()).send().await else { continue };
         if !r.status().is_success() { continue }
@@ -833,6 +1039,28 @@ pub async fn scrape_with_provenance(input: &str) -> Result<ScrapeReport, BotErro
         if !r.status().is_success() { continue }
         let Ok(text) = r.text().await else { continue };
         merge_findings(&mut findings, candidate.as_str(), &base_host, scan_page_provenanced(&text));
+    }
+
+    let raw_count = findings.len();
+    // Hard boundary: only emails whose host is on the anchor domain (or any of
+    // its subdomains) survive. Blocked-domain entries are dropped even if a
+    // mis-configured anchor would let them through.
+    findings.retain(|_key, f| {
+        let host = email_host(&f.email);
+        if host.is_empty() { return false; }
+        if is_blocked_host(&host) {
+            log::debug!("scrape: drop blocked host  {} (host={})", f.email, host);
+            return false;
+        }
+        if !is_on_anchor(&host, &anchor) {
+            log::debug!("scrape: drop off-anchor    {} (anchor={})", f.email, anchor);
+            return false;
+        }
+        true
+    });
+    let dropped = raw_count - findings.len();
+    if dropped > 0 {
+        log::info!("scrape: dropped {dropped} off-anchor/blocked address(es)");
     }
 
     let mut findings: Vec<EmailFinding> = findings.into_values().collect();

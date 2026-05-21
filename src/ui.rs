@@ -33,12 +33,13 @@ fn screen_label(screen: Screen) -> &'static str {
         Screen::Urls => "urls",
         Screen::Scraping => "scraping",
         Screen::Review => "review",
-        Screen::Compose => "compose",
+        Screen::Compose => "schedule form",
         Screen::Sending => "sending",
         Screen::Done => "done",
         Screen::History => "history",
         Screen::Enqueuing => "enqueuing",
         Screen::Queue => "queue",
+        Screen::Summary => "summary",
     }
 }
 
@@ -58,14 +59,13 @@ fn key_hints(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("↑↓", "Select"),
             ("←→", "Pick email"),
             ("Space", "Toggle skip"),
-            ("Ctrl+S", "Compose"),
+            ("Ctrl+S", "Schedule"),
             ("Ctrl+H", "History"),
             ("Esc", "Home"),
         ],
         Screen::Compose => vec![
             ("Tab", "Cycle"),
-            ("Ctrl+S", "Send now"),
-            ("Ctrl+E", "Enqueue (Gmail draft)"),
+            ("Enter/Ctrl+S", "Schedule"),
             ("Esc", "Back"),
         ],
         Screen::Sending => vec![
@@ -86,6 +86,9 @@ fn key_hints(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("R", "Reload"),
             ("↑↓", "Scroll"),
             ("Esc", "Back"),
+        ],
+        Screen::Summary => vec![
+            ("Enter", "OK"),
         ],
     }
 }
@@ -114,6 +117,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Screen::History => render_history(f, body, app),
         Screen::Enqueuing => render_enqueuing(f, body, app),
         Screen::Queue => render_queue(f, body, app),
+        Screen::Summary => render_summary(f, body, app),
     }
 
     render_bottom(f, chunks[2], app);
@@ -639,4 +643,112 @@ fn render_queue(f: &mut Frame, area: Rect, app: &mut App) {
         )
         .highlight_style(Style::default().bg(Color::Rgb(30, 30, 30)));
     f.render_stateful_widget(list, chunks[1], &mut state);
+}
+
+// ---------- Schedule summary ----------
+
+fn render_summary(f: &mut Frame, area: Rect, app: &App) {
+    let ok: Vec<&crate::app::EnqueueResult> = app
+        .enqueue_results
+        .iter()
+        .filter(|r| r.status.is_ok())
+        .collect();
+    let total = app.enqueue_results.len();
+    let failed = total - ok.len();
+
+    let first = ok.iter().min_by_key(|r| r.send_at);
+    let last = ok.iter().max_by_key(|r| r.send_at);
+
+    let fmt_when = |dt: &chrono::DateTime<chrono::Utc>| {
+        dt.with_timezone(&chrono::Local).format("%a %H:%M").to_string()
+    };
+    let label_for = |r: &crate::app::EnqueueResult| {
+        if !r.company.is_empty() { r.company.clone() } else { r.email.clone() }
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("✓ ", s_ok()),
+        Span::styled("Scheduling complete", s_bold()),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} mail(s) scheduled", ok.len()), s_bold_accent()),
+        if failed > 0 {
+            Span::styled(format!("    {failed} failed"), s_err())
+        } else {
+            Span::raw("")
+        },
+    ]));
+    lines.push(Line::from(""));
+
+    if let Some(r) = first {
+        lines.push(Line::from(vec![
+            Span::styled("First send  : ", s_dim()),
+            Span::styled(fmt_when(&r.send_at), s_accent()),
+            Span::styled("  →  ", s_dim()),
+            Span::styled(label_for(r), s_fg()),
+        ]));
+    }
+    if let Some(r) = last {
+        lines.push(Line::from(vec![
+            Span::styled("Last send   : ", s_dim()),
+            Span::styled(fmt_when(&r.send_at), s_accent()),
+            Span::styled("  →  ", s_dim()),
+            Span::styled(label_for(r), s_fg()),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    if app.scheduler_running {
+        lines.push(Line::from(vec![
+            Span::styled("Scheduler running: ", s_dim()),
+            Span::styled("✓", s_ok()),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Scheduler running: ", s_dim()),
+            Span::styled("✗", s_err()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("[!] ", s_warn()),
+            Span::styled(
+                "Scheduler is not running — mails will not be sent.",
+                s_warn(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    Start with: ", s_dim()),
+            Span::styled("cargo run --bin scheduler", s_fg()),
+        ]));
+    }
+
+    // Show every failed result inline so the user sees why some drafts didn't
+    // make it. Capped at 10 to keep the summary calm.
+    if failed > 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Failures", s_dim())));
+        for r in app.enqueue_results.iter().filter(|r| r.status.is_err()).take(10) {
+            let msg = match &r.status { Ok(_) => String::new(), Err(e) => e.clone() };
+            lines.push(Line::from(vec![
+                Span::styled("✗ ", s_err()),
+                Span::styled(r.email.clone(), s_err()),
+                Span::styled("  ", s_dim()),
+                Span::styled(msg, s_dim()),
+            ]));
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(s_dim())
+                    .title(Span::styled(" scheduling complete ", s_fg())),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
