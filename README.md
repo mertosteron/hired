@@ -9,7 +9,7 @@ Paste URLs → Scrape emails → Pick targets → Write message → Queue drafts
 ```
 
 The TUI and the scheduler are decoupled. You can close the TUI right after
-queuing — the scheduler keeps sending under systemd / launchd / Task Scheduler.
+queuing — the scheduler keeps sending under system d/ launch d/ Task Scheduler.
 
 ---
 
@@ -38,7 +38,7 @@ Get the toolchain from [rustup.rs](https://rustup.rs) (Rust 1.75 or newer).
 ### 2. Clone and build
 
 ```bash
-git clone <this-repo> Hired
+git clone https://github.com/mertosteron/hired.git
 cd Hired
 cargo build --release
 ```
